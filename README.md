@@ -1,6 +1,6 @@
 # ocbg — single background ops for opencode
 
-One manager for async work in [opencode](https://opencode.ai): background **task subagents** + **bash jobs**, with event-driven completion push (parent session gets a `[BACKGROUND DONE]` message + toast, no polling).
+One manager for async work in [opencode](https://opencode.ai): background **task subagents** + **bash jobs**, completing fully silently.
 
 ## Tools
 
@@ -14,6 +14,10 @@ One manager for async work in [opencode](https://opencode.ai): background **task
 | `background_stop(id)` | Abort, partial output preserved |
 
 Results persist under `~/.local/share/opencode/background-ops/` and survive restarts/compaction.
+
+## Model
+
+Jobs complete **silently** — no toasts, no injected messages, nothing impersonating the user. Only the agent sees reports (`background_list` flags unread completions) and relays them to the human in its own words.
 
 ## Install
 

@@ -201,28 +201,16 @@ function refreshBashJob(job: Job): Job {
   return job;
 }
 
-// Push completion into the parent session so the parent agent wakes up on
-// its own (true push — no polling needed in TUI/serve). Once-only per job.
-// Falls back gracefully when the parent is gone (one-shot `run` invocations):
-// the persisted .md/.json on disk is always the source of truth.
+// Completion is fully silent by design: no toasts, no prompt pre-fill, no
+// injected messages. The result persists to .md/.json and the job is flagged
+// unread — the human pulls via background_list/background_read when ready.
+// (opencode's plugin API can only create user-role messages, so any in-chat
+// notice would impersonate the user. Silence is the correct channel.)
 async function notifyParent(client: any, job: Job): Promise<void> {
   if (job.notified || job.state === "running") return;
   job.notified = true;
+  job.unread = true;
   saveJob(job);
-  const note =
-    `[BACKGROUND DONE] ${job.id} [${job.kind}/${job.state}] ${job.summary.slice(0, 200)}\n` +
-    `Full result: background_read("${job.id}")`;
-  try {
-    await client.session.promptAsync({
-      path: { id: job.rootSessionID },
-      body: { parts: toParts(note) },
-    });
-  } catch { /* parent gone (one-shot run) — disk persists */ }
-  try {
-    await client.tui.showToast({
-      body: { message: `Background ${job.kind} done: ${job.id}`, variant: job.state === "completed" ? "success" : "warning" },
-    });
-  } catch { /* headless — no TUI to toast */ }
 }
 
 // sessionIDs that belong to background children (recursion guard + event routing)
@@ -341,7 +329,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
 
       return {
         title: `background started: ${id}`,
-        output: `Background ${kind} started: ${id}\nIn TUI/serve the parent session gets an automatic [BACKGROUND DONE] message + toast on completion. In one-shot runs, call background_read("${id}") to retrieve the result.`,
+        output: `Background ${kind} started: ${id}\nIt completes silently — no popups, no messages. YOU (the agent) own the report: use background_read("${id}") when the result is needed and relay it to the human in your own words.`,
         metadata: { backgroundId: id, kind },
       };
     },
@@ -495,7 +483,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     },
     "experimental.chat.system.transform": async (_input, output) => {
       output.system.push(
-        `BACKGROUND OPS: use background_run(kind="task"|"bash") to launch async work, continue immediately, then background_read(id) when ready. Never poll in a loop — status is instant. Results persist under ~/.local/share/opencode/background-ops/.`
+        `BACKGROUND OPS: use background_run(kind="task"|"bash") to launch async work, continue immediately, then background_read(id) when ready. Jobs complete SILENTLY (no toasts, no messages). YOU own reporting: check background_list for unread completions and relay results to the human in your own words. Results persist under ~/.local/share/opencode/background-ops/.`
       );
     },
     "experimental.session.compacting": async (_input, output) => {
