@@ -1,6 +1,6 @@
 # ocbg — single background ops for opencode
 
-One manager for async work in [opencode](https://opencode.ai): background **task subagents** + **bash jobs** (v2.1.0).
+One manager for async work in [opencode](https://opencode.ai): background **task subagents** + **bash jobs** (v2.2.0).
 
 ## Tools (7)
 

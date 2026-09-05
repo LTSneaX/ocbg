@@ -1,11 +1,11 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { spawn, type ChildProcess } from "child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, appendFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
-const VERSION = "2.1.0"; // v2.1.0: adds idle reaper (auto-close silent running jobs after BG_IDLE_CLOSE_MS)
+const VERSION = "2.2.0"; // v2.2.0: rebuilds task-completion detection (refreshTaskJob/refreshBashJob + completeJobInternal) + OPT-1 parent noReply notice + OPT-4 always-on foundation (notifications.log + stderr + app.log)
 // Default idle window before the reaper may close a silent job: 180000ms = 3m (SneaX's number).
 // SneaX can override in ~/.config/opencode/.env via BG_IDLE_CLOSE_MS=<ms> (garbage/NaN/<=0 falls back to default).
 const IDLE_CLOSE_DEFAULT_MS = 180_000;
@@ -203,6 +203,8 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     persistOutput(job, `[FAILED after ${MAX_TRIES} tries]\n\n${lastError}\n\nRetry backoff used: ${RETRY_DELAYS_MS.join("s, ")}s. What this means: transient dispatch faults (UnknownError at SessionPrompt.createUserMessage via SessionHttpApi.promptAsync) were retried 3× before giving up. If this persists, check model/API availability before re-running.`);
     saveJob(job);
     writeHeartbeat(job, `[FAILED after ${MAX_TRIES} tries] ${lastError.slice(0, 120)}`);
+    // v2.2.0: dispatch-fail is a terminal path → uniform notify (R5 funnel).
+    await notifyJob(c, job);
   }
   function startBash(job: Job) {
     const child = spawn(job.prompt, { shell: "/bin/bash", cwd: job._cwd || directory, detached: false });
@@ -216,12 +218,10 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       chunks.push(`\n[exit code ${code}]`);
       const done = jobs.get(job.id) ?? job;
       if (done.state === "running") {
-        done.state = code === 0 ? "completed" : "failed"; done.endedAt = Date.now(); done.unread = true;
-        done.summary = chunks.join("").slice(-280).replace(/\n+/g, " ");
-        persistOutput(done, chunks.join(""));
-        saveJob(done);
-        procs.delete(job.id);
-        pumpQueue();
+        const body = chunks.join("");
+        const summary = body.slice(-280).replace(/\n+/g, " ");
+        // v2.2.0: natural bash completion → uniform terminal path (R5 funnel, notifies).
+        void completeJobInternal(done, code === 0 ? "completed" : "failed", summary, body);
       } else writeFileSync(job.outputPath, chunks.join(""));
     });
   }
@@ -251,6 +251,187 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     saveJob(live);
     procs.delete(live.id);
     pumpQueue();
+    // v2.2.0: manual + reaper stops notify uniformly (R5 funnel). Placed after
+    // pumpQueue to avoid delaying slot release on notifier latency.
+    await notifyJob(c, live);
+  }
+  // ---------------------------------------------------------------------------
+  // v2.2.0: terminal-state funnel (R5). completeJobInternal is the uniform
+  // template for NATURAL completions (task doneAt, bash close/poll, timeout),
+  // mirroring stopJobInternal's persist/save/pumpQueue tail. stopJobInternal
+  // keeps owning the "stopped" path (manual + reaper); completeJobInternal owns
+  // "completed"/"failed" (+ timeout-"stopped"). BOTH converge on notifyJob.
+  // Never throws (body wrapped in try/catch): a notifier fault must never
+  // break a terminal transition.
+  // ---------------------------------------------------------------------------
+  async function completeJobInternal(job: Job, state: "completed" | "failed" | "stopped", summary: string, fullBody?: string) {
+    try {
+      const live = jobs.get(job.id) ?? job;
+      if (live.state !== "running") return; // compare-and-set: concurrent stop/completion wins
+      live.state = state; live.endedAt = Date.now(); live.unread = true;
+      if (summary) live.summary = summary;
+      persistOutput(live, fullBody ?? summary);
+      saveJob(live);
+      procs.delete(live.id);
+      pumpQueue();
+      await notifyJob(c, live);
+    } catch (e: any) {
+      console.error(`[background-ops] completeJobInternal error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
+    }
+  }
+  // v2.2.0: R5 UNIFORM EMIT POINT — called by completeJobInternal AND
+  // stopJobInternal AND queued-removal so natural + manual + reaper ALL notify
+  // uniformly. Single-writer via notified flag. Never throws, never breaks
+  // finalize/stop. Fallback ordering: infallible sinks (file + stderr +
+  // app.log, ALWAYS emitted) first, then gated parent-injection + toast + DONE
+  // marker (only when shouldNotify).
+  // Feature-flag discipline (development/feature-flags): notify_on_complete /
+  // BG_NOTIFY_DEFAULT is an Operational long-lived flag (owner: eng).
+  // Kill-switch = notify_on_complete:false / BG_NOTIFY_DEFAULT=false. No
+  // removal trigger — the flag is permanent runtime configuration.
+  // GAP-6: the notifier does NOT depend on transform delivery — file + stderr
+  // + app.log are independent sinks; parent injection is best-effort only.
+  // GAP-7: stderr only for host-visible signal — notify-send NOT added
+  // (unavailable in headless/server contexts, out of scope).
+  async function notifyJob(client: any, job: Job) {
+    try {
+      const live = jobs.get(job.id) ?? job;
+      if (live.state === "running" || live.state === "queued") return; // terminal only: never notify (or burn the single-writer flag) mid-run
+      if (live.notified) return; // single-writer guard
+      live.notified = true; live.unread = true;
+      // Gate: per-job opt-out stored at creation from BG_NOTIFY_DEFAULT.
+      const shouldNotify = live.notifyOnComplete ?? true;
+      // --- OPT-4 always-on foundation (emitted even when gated off) ---
+      // (i) R4 notification file: JSON-lines append, O_APPEND.
+      try {
+        const base = baseDir(live._cwd ?? directory);
+        appendFileSync(join(base, ".notifications.log"), JSON.stringify({ ts: new Date().toISOString(), id: live.id, kind: live.kind, state: live.state, summary: live.summary.slice(0, 120), rootSessionID: live.rootSessionID }) + "\n", { flag: "a" });
+      } catch { /* never break the host */ }
+      // (ii) R3 stderr loud line (v1.2.0 finalizeJob L324 pattern).
+      try {
+        const elapsed = Math.round(((live.endedAt ?? Date.now()) - live.startedAt) / 1000);
+        console.error(`[background-ops] JOB ${live.id} [${live.kind}] → ${live.state.toUpperCase()} (${elapsed}s) ${live.summary.slice(0, 120)}`);
+      } catch { /* console unavailable → skip */ }
+      // (iii) R12 app.log structured event (defensive optional chaining).
+      try {
+        await client?.app?.log?.({ body: { service: "background-ops", level: live.state === "failed" ? "error" : "info", message: `bg ${live.id} → ${live.state}: ${live.summary.slice(0, 120)}`, extra: { jobId: live.id, state: live.state } } })?.catch(() => null);
+      } catch { /* headless / no app.log → skip */ }
+      if (!shouldNotify) { saveJob(live); return; } // gated off: still marked notified (no retry storm)
+      // --- OPT-1 parent injection (ONLY when shouldNotify), best-effort each ---
+      // GAP-1: promptAsync lands in parent context whenever the parent is next
+      // free; if the parent is mid-tool-call the notice waits in its queue
+      // (cosmetic ordering risk only) — policy is inject-anyway, never block.
+      const note120 = live.summary.slice(0, 120);
+      try {
+        // noReply:true → 204 void, context-only, no model turn, no billed call.
+        // NEVER a default prompt, NEVER aborts the parent.
+        await client?.session?.promptAsync?.({ path: { id: live.rootSessionID }, body: { parts: [{ type: "text", text: `[background-ops] bg ${live.id} [${live.kind}] → ${live.state}: ${note120}. Full output: background_read("${live.id}")` }], noReply: true } })?.catch(() => null);
+      } catch { /* parent gone → skip */ }
+      // GAP-2: toast is TUI-only and headless-no-op; wrapped in try/catch +
+      // optional chaining so a missing TUI surface can never throw.
+      try {
+        await client?.tui?.showToast?.({ body: { message: `bg ${live.id} → ${live.state}: ${live.summary.slice(0, 80)}`, variant: live.state === "failed" ? "error" : "success" } })?.catch(() => null);
+      } catch { /* headless → silent no-op */ }
+      // DONE marker (v1.2.0 notifyParent L412-415 pattern): prefix summary +
+      // prepend marker to persisted output so background_list shows [DONE …].
+      try {
+        const marker = `[DONE ${live.state.toUpperCase()}]`;
+        live.summary = `${marker} ${live.summary}`;
+        try {
+          const raw = readFileSync(live.outputPath, "utf8").replace(/^# .*\n\n(- .*\n)+\n---\n\n/, "");
+          persistOutput(live, `${marker}\n\n${raw}`);
+        } catch { persistOutput(live, `${marker}\n\n${live.summary}`); }
+      } catch { /* marker best-effort */ }
+      saveJob(live);
+    } catch (e: any) {
+      console.error(`[background-ops] notifyJob error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
+    }
+  }
+  // v2.2.0: task-completion detection rebuilt from v1.2.0 refreshTaskJob
+  // (L331), adapted: jobs map + writeHeartbeat, no deferreds/list-cache.
+  // Polls child messages, checks assistant doneAt, joins text parts, enforces
+  // timeout. Routes ALL terminal transitions through completeJobInternal.
+  // Never throws.
+  async function refreshTaskJob(client: any, job: Job) {
+    try {
+      const live = jobs.get(job.id) ?? job;
+      if (live.kind !== "task" || live.state !== "running" || !live.childSessionID) return;
+      writeHeartbeat(live, "polling child session…");
+      try {
+        const msgs: any = await client?.session?.messages?.({ path: { id: live.childSessionID } })?.catch(() => null);
+        if (msgs) {
+          const data = (msgs as any)?.data ?? msgs;
+          const arr: any[] = Array.isArray(data) ? data : (data as any)?.messages ?? [];
+          const assistants = arr.filter((m: any) => m?.info?.role === "assistant" || m?.role === "assistant");
+          writeHeartbeat(live, `refreshing task (${assistants.length} assistant messages)`);
+          const latest = assistants[assistants.length - 1];
+          const doneAt = latest?.info?.time?.completed ?? latest?.info?.completed ?? null;
+          if (latest && doneAt) {
+            const texts: string[] = [];
+            for (const m of assistants) {
+              const parts = m?.parts ?? m?.info?.parts ?? [];
+              for (const p of parts) {
+                if (p?.type === "text" && p?.text?.trim()) texts.push(p.text);
+              }
+            }
+            const full = texts.join("\n\n") || "(no text output)";
+            writeHeartbeat(live, `child done, finalizing (${full.length} chars)`);
+            await completeJobInternal(live, "completed", full.slice(0, 280).replace(/\n+/g, " "), full);
+            return;
+          }
+        } else {
+          writeHeartbeat(live, "poll: no messages shape (child busy?)");
+        }
+      } catch (e: any) {
+        writeHeartbeat(live, `poll exception → failed: ${String(e?.message ?? e).slice(0, 100)}`);
+        await completeJobInternal(live, "failed", `Exception polling child: ${String(e?.message ?? e).slice(0, 200)}`);
+        return;
+      }
+      // Timeout enforcement: running + elapsed > timeout → abort + stopped.
+      if ((jobs.get(live.id) ?? live).state === "running" && live.timeoutMinutes > 0) {
+        const elapsedMin = (Date.now() - live.startedAt) / 60000;
+        if (elapsedMin > live.timeoutMinutes) {
+          try { await client?.session?.abort?.({ path: { id: live.childSessionID } }).catch(() => null); } catch { /* noop */ }
+          writeHeartbeat(live, `timeout after ${live.timeoutMinutes}m — aborting child`);
+          await completeJobInternal(live, "stopped", `[TIMEOUT after ${live.timeoutMinutes}m] Partial output preserved. Use background_steer to continue in a new run.`);
+        }
+      }
+    } catch (e: any) {
+      console.error(`[background-ops] refreshTaskJob error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
+    }
+  }
+  // v2.2.0: poll-side bash check mirroring v1.2.0 refreshBashJob (L376-402)
+  // WITHOUT finalizeJob/deferreds — routes through completeJobInternal. The
+  // close-handler stays the primary completion path; this covers races where
+  // the close event fired while the record was momentarily non-running, plus
+  // timeout enforcement via .md mtime. Never throws.
+  function refreshBashJob(job: Job) {
+    try {
+      const live = jobs.get(job.id) ?? job;
+      if (live.kind !== "bash" || live.state !== "running") return;
+      const child = procs.get(live.id);
+      writeHeartbeat(live, `bash running (exitCode=${child?.exitCode ?? "pending"})`);
+      if (!child || child.exitCode !== null || (child as any)?.signalCode !== null) {
+        if ((jobs.get(live.id) ?? live).state === "running") {
+          const code = child?.exitCode ?? 0;
+          const state = code === 0 ? "completed" : "failed";
+          let body = "";
+          try { body = readFileSync(live.outputPath, "utf8").replace(/^# .*\n\n(- .*\n)+\n---\n\n/, ""); } catch { body = `(exit code ${code})`; }
+          const summary = body.slice(-280).replace(/\n+/g, " ");
+          void completeJobInternal(live, state, summary, body);
+          return;
+        }
+      }
+      if ((jobs.get(live.id) ?? live).state === "running" && live.timeoutMinutes > 0) {
+        if ((Date.now() - live.startedAt) / 60000 > live.timeoutMinutes) {
+          try { child?.kill("SIGTERM"); } catch { /* noop */ }
+          writeHeartbeat(live, `timeout after ${live.timeoutMinutes}m — SIGTERM`);
+          void completeJobInternal(live, "stopped", `[TIMEOUT after ${live.timeoutMinutes}m] Partial output preserved.`);
+        }
+      }
+    } catch (e: any) {
+      console.error(`[background-ops] refreshBashJob error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
+    }
   }
   // Conservative child-activity gate for task jobs. Returns true ONLY when the
   // child session provably shows no new activity within CONFIG.idleCloseMs.
@@ -296,6 +477,16 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
           if (ageMs === null) continue; // no/unparseable heartbeat → cannot prove stillness → skip
           if (ageMs < 0) continue; // clock skew (heartbeat in the future) → treat as fresh
           if (ageMs < CONFIG.idleCloseMs) continue; // fresh heartbeat → skip (children never polled)
+          // v2.2.0 completion sweep: finalize genuinely-done task children
+          // before evaluating silence. Deliberately placed AFTER the
+          // heartbeat-staleness gate, NOT at loop top: refreshTaskJob writes
+          // poll heartbeats, so polling every sweep would keep heartbeats
+          // forever fresh and neuter the reaper. Best-effort; completion-wins
+          // (a finalized job skips reaping via the state re-check below).
+          if (job.kind === "task" && job.childSessionID) {
+            try { await refreshTaskJob(c, job); } catch { /* best-effort */ }
+            if ((jobs.get(job.id) ?? job).state !== "running") continue; // completion won
+          }
           if (job.kind === "task") {
             if (!job.childSessionID) continue; // dispatch failed mid-flight → existing failure/timeout paths own it
             if (!(await taskChildLooksSilent(job))) continue; // fresh OR unresolvable → skip, retry next sweep
@@ -322,7 +513,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
   const idleReaperTimer = setInterval(() => { sweepIdleJobs().catch(() => { /* per-job logging already handled */ }); }, IDLE_SWEEP_INTERVAL_MS);
   (idleReaperTimer as any)?.unref?.();
   const background_run = tool({
-    description: "Run a task subagent OR bash command in background. Returns readable id immediately. Noisy by default (DONE markers in background_list). Use background_read to get full results.",
+    description: "Run a task subagent OR bash command in background. Returns readable id immediately. Noisy by default (DONE markers in background_list when notify_on_complete, default true). Use background_read to get full results.",
     args: {
       kind: tool.schema.enum(["task", "bash"]).describe("task=subagent, bash=shell"), prompt: tool.schema.string().describe("Task prompt OR shell command"),
       agent: tool.schema.string().optional().describe("Subagent name"), timeout_minutes: tool.schema.number().optional().describe("Max runtime minutes, default 15"),
@@ -354,6 +545,16 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     description: "List all background jobs with titles, summaries, states",
     args: {},
     async execute(_args, ctx) {
+      // v2.2.0: refresh running jobs before render so genuinely-done children
+      // surface as completed/failed without waiting for a sweep. Per-job
+      // try/catch: one bad job never breaks the list.
+      for (const j of [...jobs.values()]) {
+        if (j.state !== "running") continue;
+        try {
+          if (j.kind === "task") await refreshTaskJob(c, j);
+          else refreshBashJob(j);
+        } catch { /* per-job best-effort */ }
+      }
       const all = allKnownJobsFresh(ctx.directory || directory);
       return all.length ? all.map((j) => `- ${j.id} [${j.kind}/${j.state}] ${j.title} :: ${j.summary.slice(0, 120)}${j.unread ? " (unread)" : ""}`).join("\n") : "No background jobs yet.";
     },
@@ -362,6 +563,14 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     description: "Live status of background jobs with heartbeat age + current step (instant, never blocks)",
     args: { id: tool.schema.string().optional().describe("Job id, omit for all running") },
     async execute(args, ctx) {
+      // v2.2.0: same pre-render refresh as background_list (per-job try/catch).
+      for (const j of [...jobs.values()]) {
+        if (j.state !== "running") continue;
+        try {
+          if (j.kind === "task") await refreshTaskJob(c, j);
+          else refreshBashJob(j);
+        } catch { /* per-job best-effort */ }
+      }
       const all = allKnownJobsFresh(ctx.directory || directory);
       const list = args.id ? all.filter((j) => j.id === args.id) : all.filter((j) => j.state === "running" || j.state === "queued");
       if (!list.length) return args.id ? `No job ${args.id}` : "No running jobs.";
@@ -410,6 +619,8 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
         job.summary = "[STOPPED BY USER] removed from queue.";
         persistOutput(job, job.summary);
         saveJob(job);
+        // v2.2.0: queued-removal is a terminal path → uniform notify (R5 funnel).
+        await notifyJob(c, job);
         return `Stopped queued ${args.id}.`;
       }
       if (job.state !== "running") return `Job ${args.id} already ${job.state}.`;
@@ -440,11 +651,22 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     event: async ({ event }: any) => {
       try {
         const sid = event?.type === "session.idle" ? event?.properties?.sessionID : null;
-        if (sid && childSessions.has(sid)) writeFileSync(join(baseDir(directory), "last-idle.log"), `${new Date().toISOString()} | child idle ${sid}\n`, { flag: "a" });
+        if (!sid || !childSessions.has(sid)) return;
+        writeFileSync(join(baseDir(directory), "last-idle.log"), `${new Date().toISOString()} | child idle ${sid}\n`, { flag: "a" });
+        // v2.2.0: child went idle → refresh matching running jobs (finalize
+        // genuinely-done children) then uniform-notify (v1.2.0 L909-913
+        // pattern, routed through notifyJob). Best-effort per job.
+        for (const j of [...jobs.values()]) {
+          if (j.childSessionID !== sid || j.state !== "running") continue;
+          try {
+            await refreshTaskJob(c, j);
+            await notifyJob(c, j); // no-op unless refresh just finalized it
+          } catch { /* never break the host session */ }
+        }
       } catch { /* never break the host session */ }
     },
     "experimental.chat.system.transform": async (_input, output) => {
-      output.system.push(`BACKGROUND OPS v${VERSION}: use background_run(kind="task"|"bash") to launch async work, continue immediately, then background_read(id) when ready. Jobs are noisy-by-default — completions include [DONE state] markers visible in background_list. Live heartbeats visible in background_status. YOU own reporting: relay results to the human in your own words. Results persist under ~/.local/share/opencode/background-ops/.`);
+      output.system.push(`BACKGROUND OPS v${VERSION}: use background_run(kind="task"|"bash") to launch async work, continue immediately, then background_read(id) when ready. Terminal jobs emit [DONE state] markers in background_list/summary when notify_on_complete (default true); always-on .notifications.log + stderr + app.log; parent session gets best-effort noReply notice. Live heartbeats visible in background_status. YOU own reporting: relay results to the human in your own words. Results persist under ~/.local/share/opencode/background-ops/.`);
     },
     "experimental.session.compacting": async (_input, output) => {
       try {
