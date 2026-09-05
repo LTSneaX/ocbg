@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSy
 import { join } from "path";
 import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
-const VERSION = "2.2.0"; // v2.2.0: rebuilds task-completion detection (refreshTaskJob/refreshBashJob + completeJobInternal) + OPT-1 parent noReply notice + OPT-4 always-on foundation (notifications.log + stderr + app.log)
+const VERSION = "2.2.0-r3-red"; // R3-ONLY scratch layer on v2.2.0 bytes: errors-only stderr gate (failed/stopped); successes silent on stderr. EXCLUDES sweep reader, deferreds, wait_seconds, loop text.
 // Default idle window before the reaper may close a silent job: 180000ms = 3m (SneaX's number).
 // SneaX can override in ~/.config/opencode/.env via BG_IDLE_CLOSE_MS=<ms> (garbage/NaN/<=0 falls back to default).
 const IDLE_CLOSE_DEFAULT_MS = 180_000;
@@ -307,10 +307,14 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
         const base = baseDir(live._cwd ?? directory);
         appendFileSync(join(base, ".notifications.log"), JSON.stringify({ ts: new Date().toISOString(), id: live.id, kind: live.kind, state: live.state, summary: live.summary.slice(0, 120), rootSessionID: live.rootSessionID }) + "\n", { flag: "a" });
       } catch { /* never break the host */ }
-      // (ii) R3 stderr loud line (v1.2.0 finalizeJob L324 pattern).
+      // (ii) R3 stderr loud line (v1.2.0 finalizeJob L324 pattern) — R3 LAYER: errors-only gate.
+      // Successes stay silent on stderr (SneaX eyes-only: no red on success); path is file + app.log + noReply + toast + DONE.
+      // Failed/stopped (incl. reaper-kills, timeouts, dispatch-fails, manual stops) still emit.
       try {
-        const elapsed = Math.round(((live.endedAt ?? Date.now()) - live.startedAt) / 1000);
-        console.error(`[background-ops] JOB ${live.id} [${live.kind}] → ${live.state.toUpperCase()} (${elapsed}s) ${live.summary.slice(0, 120)}`);
+        if (live.state === "failed" || live.state === "stopped") {
+          const elapsed = Math.round(((live.endedAt ?? Date.now()) - live.startedAt) / 1000);
+          console.error(`[background-ops] JOB ${live.id} [${live.kind}] → ${live.state.toUpperCase()} (${elapsed}s) ${live.summary.slice(0, 120)}`);
+        }
       } catch { /* console unavailable → skip */ }
       // (iii) R12 app.log structured event (defensive optional chaining).
       try {

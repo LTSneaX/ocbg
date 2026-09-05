@@ -1,6 +1,6 @@
 # ocbg — single background ops for opencode
 
-One manager for async work in [opencode](https://opencode.ai): background **task subagents** + **bash jobs** (v2.2.0).
+One manager for async work in [opencode](https://opencode.ai): background **task subagents** + **bash jobs** (v2.2.0-r3-red: errors-only stderr — failures/stops log, successes silent).
 
 ## Tools (7)
 
@@ -21,6 +21,8 @@ Results persist under `~/.local/share/opencode/background-ops/` and survive rest
 Jobs complete **noisy-by-default** — completions include `[DONE state]` markers visible in `background_list`. Live heartbeats are visible in `background_status` (heartbeat age per job). The agent owns reporting: it relays results to the human in its own words.
 
 **Idle reaper:** jobs silent for ≥180s (`BG_IDLE_CLOSE_MS`, default 180000ms = 3m, overridable via `~/.config/opencode/.env`) are auto-closed on a ~60s sweep cadence. Sweep only evaluates; close still requires the full idle window on both signals (stale heartbeat AND stale child/output activity).
+
+**R3 red-fix:** successes silent on stderr, failures/stops still log.
 
 ## Install (explicit registration)
 
