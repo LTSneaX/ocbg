@@ -15,10 +15,13 @@ function parsePositiveMs(raw: unknown, fallback: number): number {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
+// All numeric knobs route through parsePositiveMs: 0/negative/garbage/NaN
+// falls back to the default (never a truthy-negative passthrough, never a
+// queue-bricking 0).
 const CONFIG = {
-  maxTimeoutMinutes: Number(process.env.BG_MAX_TIMEOUT_MINUTES) || 48 * 60, maxConcurrentJobs: Number(process.env.BG_MAX_CONCURRENT_JOBS) || 10,
-  jobIdType: (process.env.BG_JOB_ID_TYPE as "uuid" | "counter" | "human") || "uuid", maxBashCommandBytes: Number(process.env.BG_MAX_BASH_BYTES) || 4096,
-  listCacheTtlMs: Number(process.env.BG_LIST_CACHE_TTL_MS) || 5000, notifyDefault: (process.env.BG_NOTIFY_DEFAULT ?? "true") === "true",
+  maxTimeoutMinutes: parsePositiveMs(process.env.BG_MAX_TIMEOUT_MINUTES, 48 * 60), maxConcurrentJobs: parsePositiveMs(process.env.BG_MAX_CONCURRENT_JOBS, 10),
+  jobIdType: (process.env.BG_JOB_ID_TYPE as "uuid" | "counter" | "human") || "uuid", maxBashCommandBytes: parsePositiveMs(process.env.BG_MAX_BASH_BYTES, 4096),
+  listCacheTtlMs: parsePositiveMs(process.env.BG_LIST_CACHE_TTL_MS, 5000), notifyDefault: (process.env.BG_NOTIFY_DEFAULT ?? "true") === "true",
   idleCloseMs: parsePositiveMs(process.env.BG_IDLE_CLOSE_MS, IDLE_CLOSE_DEFAULT_MS),
   // BG_WAKE_NOTE kill-switch (default ON): when true (default), terminal states
   // fire the turn-firing reply-mode wake noteText via promptAsync WITHOUT
@@ -40,9 +43,10 @@ type Kind = "task" | "bash"; type State = "running" | "completed" | "failed" | "
 interface Job { id: string; kind: Kind; state: State; prompt: string; agent?: string; model?: string; rootSessionID: string; ownerSessionID: string; childSessionID?: string; pid?: number; startedAt: number; endedAt?: number; timeoutMinutes: number; deadlineAt?: number; steerCount?: number; timedOut?: boolean; title: string; summary: string; outputPath: string; statePath: string; unread: boolean; notified: boolean; error?: string; notifyOnComplete?: boolean; _cwd?: string; }
 // M1: single-line + length-cap untrusted text before it is injected into a
 // trusted-prefix parent wake or a DONE/list summary. Strips CR/LF (prompt-
-// injection newline breakout), collapses whitespace, trims, caps at 120 chars.
+// injection newline breakout) AND double-quote chars (""" fence-breakout),
+// collapses whitespace, trims, caps at 120 chars.
 function cleanSingleLine(s: string): string {
-  return s.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
+  return s.replace(/[\r\n]+/g, " ").replace(/"/g, "").replace(/\s+/g, " ").trim().slice(0, 120);
 }
 // L2: steers never extend the run past its original deadline.
 const MAX_STEERS = 5;
@@ -260,7 +264,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     job.pid = child.pid; procs.set(job.id, child); saveJob(job);
     writeHeartbeat(job, `bash spawned (pid=${child.pid})`);
     const chunks: string[] = [`$ ${job.prompt}\n`];
-    const writeOut = () => persistOutput(job, chunks.join(""));
+    const writeOut = () => { try { persistOutput(job, chunks.join("")); } catch { /* best-effort: never throw from EventEmitter handler */ } };
     child.stdout?.on("data", (d) => { chunks.push(String(d)); writeOut(); });
     child.stderr?.on("data", (d) => { chunks.push(`[stderr] ${String(d)}`); writeOut(); });
     child.on("close", (code) => {
@@ -271,7 +275,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
         const summary = body.slice(-280).replace(/\n+/g, " ");
         // v2.2.0: natural bash completion → uniform terminal path (R5 funnel, notifies).
         void completeJobInternal(done, code === 0 ? "completed" : "failed", summary, body);
-      } else writeFileSync(job.outputPath, chunks.join(""), { mode: 0o600 }); // L3
+      } else { try { writeFileSync(job.outputPath, chunks.join(""), { mode: 0o600 }); } catch { /* best-effort: never throw from EventEmitter handler */ } } // L3
     });
   }
   async function pumpQueue() {
@@ -381,7 +385,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       const isTimeout = live.timedOut === true || (live.state === "stopped" && elapsedMs >= timeoutMs) || (live.timedOut === undefined && /timeout/i.test(live.summary));
       const event = live.state === "completed" ? "done" : live.state === "failed" ? "failed" : isTimeout ? "timeout" : "stopped";
       const cleanEvt = live.state === "completed" ? `done: ${live.id} [${live.kind}] elapsed=${elapsedS}s` : live.state === "failed" ? `failed: ${live.id} [${live.kind}] elapsed=${elapsedS}s` : isTimeout ? `timeout: ${live.id} [${live.kind}] elapsed=${elapsedS}s` : `stopped: ${live.id} [${live.kind}] elapsed=${elapsedS}s`;
-      const cleanMsg = `${cleanEvt} :: ${live.summary.slice(0, 120)}`;
+      const cleanMsg = `${cleanEvt} :: ${cleanSingleLine(live.summary)}`;
       const exitMatch = /exit code (-?\d+)/i.exec(live.summary);
       const toastMsg = live.state === "completed" ? `✓ done, darling: ${live.id} landed clean` : live.state === "failed" ? (exitMatch ? `✗ broke, honey: ${live.id} exit ${exitMatch[1]} — come look` : `✗ broke, honey: ${live.id} — come look`) : isTimeout ? `⏱ too slow, darling: ${live.id} timed out` : `■ put down: ${live.id} killed on order`;
       // --- OPT-4 always-on foundation (emitted even when gated off) ---
@@ -713,7 +717,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     },
   });
   const background_steer = tool({
-    description: "Inject follow-up instruction into a running background task (extends timeout window)",
+    description: "Inject follow-up instruction into a running background task (deadline NOT extended)",
     args: { id: tool.schema.string().describe("Job id"), instruction: tool.schema.string().describe("Follow-up instruction") },
     async execute(args, ctx) {
       const job = jobs.get(args.id) ?? loadJob(join(baseDir(ctx.directory || directory), `${args.id}.json`));
