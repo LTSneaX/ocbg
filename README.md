@@ -16,17 +16,31 @@
 - [Troubleshooting](#troubleshooting)
 - [Rollback / uninstall](#rollback--uninstall)
 - [Docs](#docs)
+- [Credits](#credits)
 - [License](#license)
 
 ## 30-second quickstart
 
+Never used opencode plugins before? Start here. Every step is copy-pasteable — run them in order.
+
 ```sh
-# 1. Deploy the single file
+# 1. Clone the repo and enter it
+git clone https://github.com/LTSneaX/ocbg
+cd ocbg
+```
+
+```sh
+# 2. Deploy the single plugin file
 cp src/plugin/background.ts ~/.config/opencode/plugins/background.ts
+```
 
-# 2. Restart opencode (plugins load at boot only)
+```sh
+# 3. Restart the opencode server (plugins load at boot only —
+#    the new file on disk does nothing until restart)
+```
 
-# 3. Verify — call the background_config tool. It must print:
+```sh
+# 4. Verify — call the background_config tool. It must print:
 # background-ops v2.2.0-r7-turn-firing
 ```
 
@@ -46,6 +60,7 @@ If the banner shows anything older, the server has not rebooted onto this build 
 
 | Method | Command | When |
 |---|---|---|
+| Clone | `git clone https://github.com/LTSneaX/ocbg && cd ocbg` | First time — get the repo |
 | Copy to plugins (recommended) | `cp src/plugin/background.ts ~/.config/opencode/plugins/background.ts` + restart | Normal install and every update |
 | From repo (development) | Work in this repo, then copy the single file live as above | Changing the plugin itself |
 | Verify | Call `background_config` — banner must read `background-ops v2.2.0-r7-turn-firing` | After every install, update, or restart |
@@ -171,6 +186,10 @@ To restore: copy a `backups/` copy (or any repo version) back over `plugins/back
 - `docs/troubleshooting.md` — full troubleshooting tree
 - `docs/history.md` — complete project history with version SHAs
 
+## Credits
+
+Created and owned by **LTSneaX** — design and crew work by **Mavis**.
+
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE).
