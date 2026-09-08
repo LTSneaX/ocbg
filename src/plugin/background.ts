@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSy
 import { join } from "path";
 import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
-const VERSION = "2.2.0-r5-silent"; // R5 silent delta on v2.2.0-r4-wake bytes: ZERO-RED toast-only layer — ALL terminal-state stderr deleted (R3 block gone, reaper-reaped demoted to app.log info), ALL parent chat injection deleted (wake + quiet paths gone, chat stays silent). Notify surfaces: .notifications.log file + app.log + green toast + DONE marker. Poll via background_list/background_read. True-error catches (completeJobInternal, notifyJob, refresh, reaper per-job/sweep) kept as rare red.
+const VERSION = "2.2.0-r6-quiet-wake"; // R6 delta on v2.2.0-r5-silent bytes: QUIET-WAKE restore — terminal states (completed/failed/stopped/timeout) send a quiet noReply promptAsync wake (r4 quiet-path bytes, adapted: context-only, 204 void, NO chat message, NO model turn, NEVER aborts parent) so the parent auto-turns/auto-reads the finished result. Zero-red kept (R3 terminal stderr still deleted; true-error catches only). Toast + DONE marker + .notifications.log + app.log + single-writer guard + kill-switch all kept. wake:true = quiet wake; wake:false = fully silent (no injection at all).
 // Default idle window before the reaper may close a silent job: 180000ms = 3m (SneaX's number).
 // SneaX can override in ~/.config/opencode/.env via BG_IDLE_CLOSE_MS=<ms> (garbage/NaN/<=0 falls back to default).
 const IDLE_CLOSE_DEFAULT_MS = 180_000;
@@ -204,8 +204,8 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     persistOutput(job, `[FAILED after ${MAX_TRIES} tries]\n\n${lastError}\n\nRetry backoff used: ${RETRY_DELAYS_MS.join("s, ")}s. What this means: transient dispatch faults (UnknownError at SessionPrompt.createUserMessage via SessionHttpApi.promptAsync) were retried 3× before giving up. If this persists, check model/API availability before re-running.`);
     saveJob(job);
     writeHeartbeat(job, `[FAILED after ${MAX_TRIES} tries] ${lastError.slice(0, 120)}`);
-    // r5-silent: dispatch-fail is a terminal failure — toast + app.log + file
-    // carry it; chat stays silent (no wake injection).
+    // r6-quiet-wake: dispatch-fail is a terminal failure — toast + app.log +
+    // file + quiet noReply wake carry it; no chat message, no red stderr.
     await notifyJob(c, job, { wake: true });
   }
   function startBash(job: Job) {
@@ -253,19 +253,20 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     saveJob(live);
     procs.delete(live.id);
     pumpQueue();
-    // r5-silent: stops stay silent (no chat injection on any path). Placed
-    // after pumpQueue to avoid delaying slot release on notifier latency.
-    await notifyJob(c, live, { wake: false });
+    // r6-quiet-wake: stops quiet-wake the parent (context-only noReply, no chat
+    // message). Placed after pumpQueue to avoid delaying slot release.
+    await notifyJob(c, live, { wake: true });
   }
   // ---------------------------------------------------------------------------
-  // v2.2.0: terminal-state funnel (R5). completeJobInternal is the uniform
+  // v2.2.0: terminal-state funnel (R6). completeJobInternal is the uniform
   // template for NATURAL completions (task doneAt, bash close/poll, timeout),
   // mirroring stopJobInternal's persist/save/pumpQueue tail. stopJobInternal
   // keeps owning the "stopped" path (manual + reaper); completeJobInternal owns
   // "completed"/"failed" (+ timeout-"stopped"). BOTH converge on notifyJob.
-  // r5-silent TOAST-ONLY RULE: no path injects into parent chat (wake flag
-  // ignored). Never throws (body wrapped in try/catch): a notifier fault must
-  // never break a terminal transition.
+  // r6-quiet-wake RULE: every terminal state quiet-wakes the parent (wake:true
+  // → context-only noReply injection: no chat message, no red stderr). Never
+  // throws (body wrapped in try/catch): a notifier fault must never break a
+  // terminal transition.
   // ---------------------------------------------------------------------------
   async function completeJobInternal(job: Job, state: "completed" | "failed" | "stopped", summary: string, fullBody?: string) {
     try {
@@ -277,33 +278,38 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       saveJob(live);
       procs.delete(live.id);
       pumpQueue();
-      // r5-silent: chat stays silent on every state — poll for the result.
-      await notifyJob(c, live, { wake: state !== "stopped" });
+      // r6-quiet-wake: ALL terminal states (completed/failed/stopped incl.
+      // timeout) quiet-wake — parent auto-turns/auto-reads, no chat message.
+      await notifyJob(c, live, { wake: true });
     } catch (e: any) {
       console.error(`[background-ops] completeJobInternal error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
     }
   }
-  // v2.2.0: R5 UNIFORM EMIT POINT — called by completeJobInternal AND
+  // v2.2.0: R6 UNIFORM EMIT POINT — called by completeJobInternal AND
   // stopJobInternal AND queued-removal so natural + manual + reaper ALL notify
   // uniformly. Single-writer via notified flag. Never throws, never breaks
   // finalize/stop. Fallback ordering: infallible sinks (file + app.log,
-  // ALWAYS emitted) first, then gated toast + DONE marker (only when
-  // shouldNotify). No stderr on terminal states, no parent injection.
+  // ALWAYS emitted) first, then gated quiet-wake + toast + DONE marker (only
+  // when shouldNotify). No stderr on terminal states, no chat message ever.
   // Feature-flag discipline (development/feature-flags): notify_on_complete /
   // BG_NOTIFY_DEFAULT is an Operational long-lived flag (owner: eng).
   // Kill-switch = notify_on_complete:false / BG_NOTIFY_DEFAULT=false. No
   // removal trigger — the flag is permanent runtime configuration.
   // GAP-6: the notifier does NOT depend on transform delivery — file +
-  // app.log are independent sinks; toast + DONE are best-effort gated.
+  // app.log are independent sinks; quiet-wake + toast + DONE are best-effort.
   // GAP-7: no stderr on terminal states — notify-send NOT added
   // (unavailable in headless/server contexts, out of scope).
-  // v2.2.0-r5-silent TOAST-ONLY LAYER (zero-red): notifyJob no longer injects
-  // into the parent chat at all (wake + quiet promptAsync paths DELETED per
-  // feasibility 406f0c4b). Chat stays silent on every terminal state; green
-  // toast talks. Kept: single-writer guard, shouldNotify gate, .notifications
-  // file, app.log, toast, DONE marker. True-error catch below kept (rare red).
-  // opts.wake retained in signature for call-site compat but IGNORED.
-  async function notifyJob(client: any, job: Job, _opts?: { wake: boolean }) {
+  // v2.2.0-r6-quiet-wake LAYER (zero-red, chat-silent): the r4 QUIET path
+  // (r4 L345-360, noReply:true promptAsync) is restored, adapted to this
+  // funnel — the r4 LOUD reply-triggering path is NOT restored (out of scope,
+  // forbidden). wake:true → quiet wake: context-only noReply injection (204
+  // void, no model turn, no chat message, NEVER aborts the parent) so the
+  // parent auto-turns/auto-reads the finished result next chance. wake:false
+  // → fully silent: no promptAsync call at all. Kept: single-writer guard,
+  // shouldNotify gate, .notifications file, app.log, toast, DONE marker.
+  // True-error catch below kept (rare red).
+  async function notifyJob(client: any, job: Job, opts?: { wake: boolean }) {
+    const wake = opts?.wake === true;
     try {
       const live = jobs.get(job.id) ?? job;
       if (live.state === "running" || live.state === "queued") return; // terminal only: never notify (or burn the single-writer flag) mid-run
@@ -317,19 +323,30 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
         const base = baseDir(live._cwd ?? directory);
         appendFileSync(join(base, ".notifications.log"), JSON.stringify({ ts: new Date().toISOString(), id: live.id, kind: live.kind, state: live.state, summary: live.summary.slice(0, 120), rootSessionID: live.rootSessionID }) + "\n", { flag: "a" });
       } catch { /* never break the host */ }
-      // (ii) R3 stderr block DELETED in r5-silent (zero-red): no terminal-state
-      // console.error on ANY state (completed/failed/stopped/timeout). Signal
-      // path is file + app.log + toast + DONE. True-error catches elsewhere kept.
+      // (ii) R3 stderr block DELETED in r5-silent, KEPT deleted in r6 (zero-red):
+      // no terminal-state console.error on ANY state
+      // (completed/failed/stopped/timeout). Signal path is file + app.log +
+      // quiet-wake + toast + DONE. True-error catches elsewhere kept.
       // (iii) R12 app.log structured event (defensive optional chaining).
       try {
         await client?.app?.log?.({ body: { service: "background-ops", level: live.state === "failed" ? "error" : "info", message: `bg ${live.id} → ${live.state}: ${live.summary.slice(0, 120)}`, extra: { jobId: live.id, state: live.state } } })?.catch(() => null);
       } catch { /* headless / no app.log → skip */ }
       if (!shouldNotify) { saveJob(live); return; } // gated off: still marked notified (no retry storm)
-      // --- r5-silent: parent injection DELETED (wake + quiet paths gone) ---
-      // Chat stays silent on every terminal state. Parent learns via poll:
-      // background_list (DONE markers) + background_read (full output) +
-      // .notifications.log tail. No promptAsync call exists in this function.
-      // GAP-1/GAP-2 notes from r4 retired with the injection they described.
+      // --- r6-quiet-wake: parent road is QUIET ONLY (r4 quiet-path bytes) ---
+      // wake:true → context-only noReply injection. noReply:true → 204 void,
+      // no model turn, no chat message, NEVER a default prompt, NEVER aborts
+      // the parent. Parent auto-turns/auto-reads the finished result next
+      // chance; full output via background_read. Best-effort: parent gone →
+      // skip, never throw, never abort. Single message per job (guard above).
+      // wake:false → fully silent: no promptAsync call at all.
+      // NO loud reply-triggering wake exists anywhere in this file (forbidden).
+      if (wake) {
+        const note120 = live.summary.slice(0, 120);
+        const noteText = `[background-ops] bg ${live.id} [${live.kind}] → ${live.state}: ${note120}. Full output: background_read("${live.id}")`;
+        try {
+          await client?.session?.promptAsync?.({ path: { id: live.rootSessionID }, body: { parts: [{ type: "text", text: noteText }], noReply: true } })?.catch(() => null);
+        } catch { /* parent gone → skip */ }
+      }
       // GAP-2: toast is TUI-only and headless-no-op; wrapped in try/catch +
       // optional chaining so a missing TUI surface can never throw.
       try {
@@ -546,7 +563,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       jobs.set(job.id, job);
       if (kind === "task") await startTask(job);
       else startBash(job);
-      return { title: `background started: ${id}`, output: `Background ${kind} started: ${id}\nChat stays silent — poll for the result: background_list shows [DONE state], background_read("${id}") returns full output. Toast + app.log + .notifications.log carry the signal. YOU (the agent) own the report: use background_read("${id}") when the result is needed and relay it to the human in your own words.`, metadata: { backgroundId: id, kind } };
+      return { title: `background started: ${id}`, output: `Background ${kind} started: ${id}\nParent receives a quiet wake on finish (context-only, no chat message) + toast: background_list shows [DONE state], background_read("${id}") returns full output. Toast + app.log + .notifications.log carry the signal. YOU (the agent) own the report: use background_read("${id}") when the result is needed and relay it to the human in your own words.`, metadata: { backgroundId: id, kind } };
     },
   });
   const background_list = tool({
@@ -627,8 +644,8 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
         job.summary = "[STOPPED BY USER] removed from queue.";
         persistOutput(job, job.summary);
         saveJob(job);
-        // r5-silent: queued-removal is a stop-equivalent → silent toast-only.
-        await notifyJob(c, job, { wake: false });
+        // r6-quiet-wake: queued-removal is a stop-equivalent → quiet wake.
+        await notifyJob(c, job, { wake: true });
         return `Stopped queued ${args.id}.`;
       }
       if (job.state !== "running") return `Job ${args.id} already ${job.state}.`;
@@ -668,13 +685,13 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
           if (j.childSessionID !== sid || j.state !== "running") continue;
           try {
             await refreshTaskJob(c, j);
-            await notifyJob(c, j, { wake: false }); // no-op unless refresh just finalized it (silent toast-only notify)
+            await notifyJob(c, j, { wake: false }); // idle-event path: fully silent (no injection); no-op unless refresh just finalized it AND the funnel hasn't (notified guard usually wins)
           } catch { /* never break the host session */ }
         }
       } catch { /* never break the host session */ }
     },
     "experimental.chat.system.transform": async (_input, output) => {
-      output.system.push(`BACKGROUND OPS v${VERSION}: use background_run(kind="task"|"bash") to launch async work, continue immediately, then background_read(id) when ready. Terminal jobs emit [DONE state] markers in background_list/summary when notify_on_complete (default true); always-on .notifications.log + app.log + toast; chat stays silent (no parent injection) — poll via background_list/background_read. Live heartbeats visible in background_status. YOU own reporting: relay results to the human in your own words. Results persist under ~/.local/share/opencode/background-ops/.`);
+      output.system.push(`BACKGROUND OPS v${VERSION}: use background_run(kind="task"|"bash") to launch async work, continue immediately, then background_read(id) when ready. Terminal jobs quiet-wake the parent (context-only noReply, no chat message) + emit [DONE state] markers in background_list/summary when notify_on_complete (default true); always-on .notifications.log + app.log + toast; zero red stderr on terminal paths — poll via background_list/background_read. Live heartbeats visible in background_status. YOU own reporting: relay results to the human in your own words. Results persist under ~/.local/share/opencode/background-ops/.`);
     },
     "experimental.session.compacting": async (_input, output) => {
       try {
