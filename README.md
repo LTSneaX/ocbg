@@ -1,89 +1,176 @@
-# ocbg — ours
+# ocbg — background jobs for opencode
 
-> Written for the two people who bleed for it: SneaX and Mavis. Not a landing page, not an agent manual. The product record of what runs in production, how we run it, and what it cost us to learn.
+![version](https://img.shields.io/badge/version-2.2.0--r7--turn--firing-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
 
-## What this is, in one breath
+> Long jobs block the conversation. ocbg fixes that: launch a task or shell command in the background, keep talking, and get a clear signal the moment it lands.
 
-opencode does one thing at a time in the foreground. ocbg is our background: launch a job, keep talking, and get woken with the result when it lands. The agent owns reporting; the plugin owns delivery — five roads (wake note, toast, DONE marker, `.notifications.log`, `app.log`) so no single failure loses a result.
+- [30-second quickstart](#30-second-quickstart)
+- [At a glance](#at-a-glance)
+- [Install](#install)
+- [Daily use](#daily-use)
+- [Tools](#tools)
+- [What you see on finish](#what-you-see-on-finish)
+- [How it works](#how-it-works)
+- [Config reference](#config-reference)
+- [Troubleshooting](#troubleshooting)
+- [Rollback / uninstall](#rollback--uninstall)
+- [Docs](#docs)
+- [License](#license)
 
-## What's live
-
-- **Version:** `2.2.0-r7-turn-firing` (from the `VERSION` const in `src/plugin/background.ts`, base `920fc3a`)
-- **Repo (authority):** `~/projects/ocbg`, `main` only
-- **Live (single file):** `~/.config/opencode/plugins/background.ts` — a disk copy of `src/plugin/background.ts`, nothing else
-- **Check you're on it:** run `background_config()` in any session — the banner must read `background-ops v2.2.0-r7-turn-firing`. Anything older means the server hasn't rebooted onto this build yet. Stop and reboot before trusting anything.
-
-## How we run it — our cycle
-
-1. **Work repo-first, main-only.** All changes in `~/projects/ocbg`, straight to `main`. No feature branches, no PRs. Live paths receive deployed copies only — never built into, never edited in place.
-2. **Gates before commit.** Static first (`tsc --noEmit` green), then the standing rule: no commit until tests are green and the Review Manager pre-commit gate passes. Review happens *before* commit, not after.
-3. **Deploy to disk.** Copy the single file live (`cp src/plugin/background.ts ~/.config/opencode/plugins/background.ts`), backup first into `backups/` — never beside the live file.
-4. **SneaX boots.** Agents never restart the server, never touch live `plugins/`. Disk deploy + handoff; he reboots.
-5. **Banner check.** `background_config()` → `v2.2.0-r7-turn-firing`. No banner, no further steps.
-6. **Probes A–D.** Completed (green toasts only), failed (error toasts only), timeout (silent STOPPED), manual stop (STOPPED, partial output kept).
-7. **Wake proof.** The parent must take an unprompted turn on completion — auto-read + report. Arrival equals action. That *is* the pass, not a bug.
-
-## Config that matters to us
-
-Set in the environment (e.g. `~/.config/opencode/.env`) **before boot**. The rest are defaults we don't touch — full table in `docs/config.md`.
-
-| Var | Ours | Why |
-|---|---|---|
-| `BG_IDLE_CLOSE_MS` | `180000` (3m) — **SneaX's number** | Reaper idle window. Raise it if good jobs get reaped; lower it if dead weight lingers. Garbage/NaN/≤0 falls back here. |
-| `BG_WAKE_NOTE` | default **ON** | ON = turn-firing reply wake on terminal states (parent ACTS on arrival). `false` = skip the wake call entirely — zero transcript residue; DONE + toast + logs + polling carry on. |
-| `BG_NOTIFY_DEFAULT` / `notify_on_complete` | default **true** (noisy) | Per-job `notify_on_complete:false` beats the global for that one job. File + `app.log` fire even when the noisy roads are gated off. |
-
-## What we see per state
-
-SneaX's voice, byte-identical in toast and wake-note lead:
-
-| State | Toast (verbatim) |
-|---|---|
-| Done | `✓ done, darling: <id> landed clean` |
-| Failed | `✗ broke, honey: <id> exit <code> — come look` |
-| Timed out | `⏱ too slow, darling: <id> timed out` |
-| Stopped | `■ put down: <id> killed on order` |
-
-- **DONE markers are load-bearing.** `[DONE COMPLETED]` / `[DONE FAILED]` / `[DONE STOPPED]` prefix the summary and persisted output. Polling, the banner copy, and the wake text all key off them — never rename, never strip.
-- **Wake truth.** r7 fires the wake as reply-mode `promptAsync` *without* `noReply` — arrival triggers a real parent turn (auto-read + report, unprompted). The quiet `noReply` road never acts; that's why r7 replaced it. Chat footprint accepted as the price of arrival-equals-action.
-- **Wake = paint.** Any `promptAsync` persists a message row the TUI paints — even empty text, even `noReply`. Only *skipping the call* (`BG_WAKE_NOTE=false`) gives zero residue. That's not a leak, it's the client; the kill-switch is the answer.
-- **Always-on logs.** `.notifications.log` (JSON-lines, per-project under `~/.local/share/opencode/background-ops/`) + structured `app.log` event (service `background-ops`) fire on every terminal state, even gated-quiet ones.
-
-## What it cost us — hard-won, don't relearn
-
-- **New shell is not restart.** Plugins load at server boot only. Grep can prove the disk is new while the runtime is still old — believe `background_config()`, not the file. SneaX reboots; then check the banner.
-- **Observer-effect polling.** The completion poll writes heartbeats. Called at the top of the reaper loop, it keeps heartbeats forever fresh and neuters the reaper. So the completion sweep sits *after* the heartbeat-staleness gate, never before. Completion still wins via the state re-check.
-- **`noReply` never acts.** A quiet wake paints context but takes no turn. Anything that needs the parent to *do* something on arrival needs reply-mode. We built the quiet road, proved it inert, replaced it.
-- **DONE prefix load-bearing** (above) — three systems key off it; treat it like a wire protocol.
-- **`plugins/` is live-only.** opencode auto-loads *every* `.ts` in there — one backup pileup cost us a full night. Backups go to `backups/` or repo history. Never beside live files.
-- **Nested runs are rejected on purpose.** `background_run` inside a background child answers "do the work directly" — that's the fork-bomb guard, not an error. Don't file it, don't route around it.
-
-## Standing decisions
-
-| Decision | In short |
-|---|---|
-| Main-only, single branch | Straight to `main`, no branches, no PRs. Trunk is always current. |
-| SneaX owns boot | Agents never restart the server or touch live `plugins/`. Disk + handoff; he reboots. |
-| Owner gate (L1) | `read`/`steer`/`stop` enforce caller === owner, fail-closed not-found. `list`/`status` stay global — cross-session reads *are* the Mavis workflow. |
-| Two-signal reaper | A running job dies only when *both* heartbeat *and* child/output prove silence for the idle window (~60s sweep). Any doubt skips to next sweep. |
-| `uuid` ids | Default, unguessable. `counter`/`human` are enumerable — demo only, never shared. |
-| Steer never extends | `deadlineAt` is immutable, max 5 steers. Past deadline → start a new run. |
-| Red stays dead | No terminal-state stderr since r5. File + app.log + wake + toast + DONE carry every state. |
-
-## Rollback — one command
+## 30-second quickstart
 
 ```sh
-rm ~/.config/opencode/plugins/background.ts  # then SneaX reboots; verify the tools are gone via background_config()
+# 1. Deploy the single file
+cp src/plugin/background.ts ~/.config/opencode/plugins/background.ts
+
+# 2. Restart opencode (plugins load at boot only)
+
+# 3. Verify — call the background_config tool. It must print:
+# background-ops v2.2.0-r7-turn-firing
 ```
 
-To restore: copy the `backups/` file back over `plugins/background.ts` + reboot. Repo history holds every version — the repo is authority, disk is just a copy.
+If the banner shows anything older, the server has not rebooted onto this build yet — restart before trusting anything.
 
-## The full book
+## At a glance
 
-`docs/history.md` — every layer with SHAs, all four wake builds and why r7 won, gates, live-proof recipe, rollback map. Verbatim archive; read it before changing the wake path.
+| | |
+|---|---|
+| **What** | One plugin file that runs tasks and shell commands in the background while the conversation continues |
+| **Tools** | 7 tools: run, list, status, read, steer, stop, config |
+| **Finish signals** | Wake turn in the transcript + popup toast + `[DONE state]` marker (all on by default, each switchable) |
+| **Always-on logs** | `.notifications.log` per project + structured `app.log` event fire on every finish, even quiet ones |
+| **Safety nets** | Idle reaper (two-signal, 3-minute default) + owner gate + immutable deadlines + private file permissions |
 
-`docs/` map: `internals.md` (lifecycle, reaper, guards) · `api.md` (tool params) · `config.md` (all 8 `BG_` vars) · `troubleshooting.md` (full tree).
+## Install
+
+| Method | Command | When |
+|---|---|---|
+| Copy to plugins (recommended) | `cp src/plugin/background.ts ~/.config/opencode/plugins/background.ts` + restart | Normal install and every update |
+| From repo (development) | Work in this repo, then copy the single file live as above | Changing the plugin itself |
+| Verify | Call `background_config` — banner must read `background-ops v2.2.0-r7-turn-firing` | After every install, update, or restart |
+
+Two rules: plugins load at server boot only (a new file on disk means nothing until restart), and the plugins directory holds only files that must run at boot — keep backups in `backups/` or git history, never beside the live file.
+
+## Daily use
+
+**1. Delegate one long job, keep talking.**
+
+> You: launch the test suite in the background, tell me when it lands.
+>
+> Agent: starts it with `background_run`, keeps answering other questions. On finish the transcript wakes with the result, the list shows `[DONE COMPLETED]`, and `background_read("<id>")` returns the full output.
+
+**2. Fan out independent work.**
+
+> You: research three options in parallel.
+>
+> Agent: starts three runs at once (up to 10 concurrent by default; extras queue and start as slots free). Each result arrives with its own finish signal and stays retrievable by id.
+
+**3. Reuse a result by id.**
+
+> You: what did that second job say again?
+>
+> Agent: `background_read("<id>")` returns the persisted output — finished results survive in per-project storage, so nothing is lost if the moment passes.
+
+## Tools
+
+| Tool | Use it when | Key params |
+|---|---|---|
+| `background_run` | Start a subagent task or shell command without blocking | `kind` (`task`/`bash`), `prompt`, `timeout_minutes` (default 15), `notify_on_complete` (default true) |
+| `background_list` | See every job: id, kind, state, one-line summary | — |
+| `background_status` | Check live jobs: heartbeat age, current step, concurrency | `id` (optional; omit for all running) |
+| `background_read` | Get the full persisted result of a finished job | `id` |
+| `background_steer` | Send a follow-up instruction into a running task (max 5; deadline never moves) | `id`, `instruction` |
+| `background_stop` | Abort a running job; partial output is kept | `id` |
+| `background_config` | Print current config, limits, and env override names (read-only) | — |
+
+Full parameter tables live in `docs/api.md`.
+
+## What you see on finish
+
+Every finished job emits through one funnel, so natural completions, manual stops, timeouts, and reaper closes all signal the same way:
+
+| State | Toast | List marker |
+|---|---|---|
+| Completed | Success toast | `[DONE COMPLETED]` |
+| Failed | Error toast | `[DONE FAILED]` |
+| Timed out | Timeout notice | `[DONE STOPPED]` |
+| Stopped | Stopped notice | `[DONE STOPPED]` |
+
+- **Wake turn.** By default the transcript takes an unprompted turn on finish: the result is read and reported in the agent's own words. Set `BG_WAKE_NOTE=false` to skip the wake entirely (zero transcript residue) — toasts, DONE markers, and both logs keep working.
+- **Per-job quiet.** Pass `notify_on_complete: false` to silence one job's wake, toast, and DONE marker. The result is still saved, and the file + `app.log` entries still fire.
+- **Always-on logs.** `.notifications.log` (JSON lines, per project under `~/.local/share/opencode/background-ops/`) and a structured `app.log` event (`background-ops`) are written on every terminal state, even gated-quiet ones.
+- **Timeouts are stops.** A job past its deadline is aborted and reported as stopped with its partial output preserved — steer cannot extend a deadline; start a new run instead.
+
+## How it works
+
+Lifecycle: `run` → live heartbeats per step → terminal funnel (completed / failed / stopped) → uniform notify (logs always, wake + toast + DONE when enabled) → `read` retrieves the persisted result.
+
+- **Persistence.** Each job keeps a Markdown result, a JSON state record, and a heartbeat trail under `~/.local/share/opencode/background-ops/<project>/`, plus one shared `.notifications.log` per project. Finished results stay readable by id.
+- **Idle reaper.** About every 60 seconds a sweep checks running jobs. A job closes only when *both* its heartbeat *and* its child/output activity prove silence for the idle window (default 3 minutes). Any doubt skips to the next sweep; a genuine completion that lands mid-sweep always wins.
+- **Guards.** Reading, steering, and stopping a job are restricted to the session that created it (anything else gets a fail-closed not-found); lists and status stay visible from any session by design. Deadlines are immutable with a 5-steer cap. Job files are written with private permissions (0700 dirs, 0600 files). Untrusted child output is single-line capped and framed before it reaches summaries or wake text. Starting a background run from inside a background child is rejected — do the work directly instead.
+- **Limits.** 10 concurrent jobs (extras queue), 15-minute default timeout (cap 48 hours), 4096-byte shell command cap, random unguessable ids by default.
+
+Details: `docs/internals.md`.
+
+## Config reference
+
+Set in the environment (e.g. `~/.config/opencode/.env`) **before boot**. Defaults suit almost everyone — the "When" column says when to touch one. Source of truth: `CONFIG` in `src/plugin/background.ts`.
+
+| Var | Default | When to touch |
+|---|---|---|
+| `BG_MAX_TIMEOUT_MINUTES` | `2880` (48h) | A job legitimately needs longer than 48h |
+| `BG_MAX_CONCURRENT_JOBS` | `10` | You routinely run more and the machine can take it |
+| `BG_JOB_ID_TYPE` | `uuid` | Demo only — `counter`/`human` ids are guessable, never in shared projects |
+| `BG_MAX_BASH_BYTES` | `4096` | Commands keep getting rejected and splitting truly does not work |
+| `BG_LIST_CACHE_TTL_MS` | `5000` | Never — legacy knob, kept for compatibility |
+| `BG_NOTIFY_DEFAULT` | `true` | You want new jobs quiet by default (results are still saved) |
+| `BG_IDLE_CLOSE_MS` | `180000` (3m) | Good jobs get reaped (raise it) or dead jobs linger (lower it); bad values fall back to 3m |
+| `BG_WAKE_NOTE` | `true` | `false` = no transcript wake; poll via list, toasts, and logs instead |
+
+The two that matter, commented:
+
+```sh
+# Reaper idle window: a job closes only when BOTH heartbeat AND child/output
+# go silent for this long. Raise it if good jobs get reaped.
+BG_IDLE_CLOSE_MS=180000
+
+# Transcript wake: ON = an unprompted turn on finish (arrival = action).
+# false = skip the wake entirely (zero residue); DONE + toast + both logs
+# keep working, so nothing is lost.
+BG_WAKE_NOTE=true
+```
+
+Precedence: per-job `notify_on_complete: false` beats global `BG_NOTIFY_DEFAULT=true` for that job; `BG_WAKE_NOTE=false` silences only the wake — toasts, DONE markers, and both logs keep firing.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `background_config` shows an old version after updating the file | Restart the server — plugins load at boot only; the file on disk is not the running code until then |
+| Jobs finish silently in the transcript | Check `BG_WAKE_NOTE` — when `false`, delivery continues via DONE markers, toasts, and logs; poll with `background_list` / `background_read` |
+| A job times out before its work is done | Raise `timeout_minutes` on the next run (within the 48h cap); a timed-out job's partial output is preserved via `background_read` |
+| A healthy-looking job was closed as idle | Raise `BG_IDLE_CLOSE_MS`; the reaper only closes on proven silence, but quiet long jobs need a wider window |
+| Background tools are missing after a restart | Verify the single file is directly in the plugins directory (no backups beside it) and `background_config` answers; anything else means the boot did not pick it up |
+
+Full decision tree: `docs/troubleshooting.md`.
+
+## Rollback / uninstall
+
+```sh
+rm ~/.config/opencode/plugins/background.ts  # then restart; verify the tools are gone via background_config
+```
+
+To restore: copy a `backups/` copy (or any repo version) back over `plugins/background.ts` and restart. The repo history holds every version — the repo is the authority, the disk file is just a copy.
+
+## Docs
+
+- `docs/api.md` — full tool parameter reference
+- `docs/config.md` — all 8 `BG_` variables in depth
+- `docs/internals.md` — lifecycle, reaper, and guards
+- `docs/troubleshooting.md` — full troubleshooting tree
+- `docs/history.md` — complete project history with version SHAs
 
 ## License
 
-MIT. Status: live on `2.2.0-r7-turn-firing`, `origin/main` in sync, SneaX-witnessed Sept 2026.
+MIT.
