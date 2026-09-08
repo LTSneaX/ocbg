@@ -1,15 +1,245 @@
 # background-ops — async work for opencode that never gets lost
 
-One file — `src/plugin/background.ts` — gives opencode 7 tools:
-launch a task subagent or a shell job, keep working,
-get woken when it finishes, read the full result whenever.
+You run long jobs in the background, keep working, and get told when they
+finish. One file — `src/plugin/background.ts` — gives your opencode session
+7 tools: start a job, keep working, get woken when it lands, read the full
+result whenever you like. Nothing gets lost: every result is saved on disk,
+so it survives restarts.
 
 Live version: `2.2.0-r7-turn-firing` (commit `4ad4612`).
 Status: proven live, SneaX-witnessed, Sept 2026.
 
 ---
 
-## 1. What it is
+## Install (3 steps, ~2 minutes)
+
+**1. Copy the one file into your live plugins folder:**
+
+```sh
+mkdir -p ~/.config/opencode/plugins
+cp src/plugin/background.ts ~/.config/opencode/plugins/background.ts
+```
+
+**2. Restart the opencode server.**
+
+Plugins load at server boot only — opening a new shell is not a restart.
+(If someone else manages your server, ask them to reboot; agents never do
+this for you.)
+
+Also check your global `opencode.json` registers it (see
+`opencode.json.example` in this repo):
+
+```json
+{
+  "plugin": [
+    "./plugins/background.ts"
+  ]
+}
+```
+
+**3. Verify you are on the new build.** Inside any session, run:
+
+```
+background_config()
+```
+
+You should see this banner:
+
+```
+background-ops v2.2.0-r7-turn-firing
+```
+
+If it says anything older, you are still on the old build — the server has
+not rebooted onto the new file yet. Stop and reboot before testing further.
+
+Requires `@opencode-ai/plugin` (already present in standard configs).
+
+---
+
+## Settings — every `BG_` variable
+
+You set these in your environment (for example in
+`~/.config/opencode/.env`) before the server boots. In almost all cases the
+defaults are right — the "when to touch" column tells you the exceptions.
+
+| Setting | Default | What it does | When to touch it |
+|---------|---------|--------------|------------------|
+| `BG_MAX_TIMEOUT_MINUTES` | `2880` (48h) | Longest any single job may run before it is stopped. | You have a job that legitimately needs more than 48h (rare). |
+| `BG_MAX_CONCURRENT_JOBS` | `10` | How many jobs run at once. Extra jobs queue and start in order. | You routinely run more than 10 at once and your machine can take it. |
+| `BG_JOB_ID_TYPE` | `uuid` | Shape of job ids: `uuid` (long, unguessable), `counter` (`job-1`, `job-2`…), `human` (`swift-amber-falcon`…). | Leave on `uuid`. Only switch for a quick demo — `counter`/`human` ids are guessable, so never use them in a shared project. |
+| `BG_MAX_BASH_BYTES` | `4096` | Longest shell command you may launch in one go. Longer is rejected. | Your commands keep getting rejected — split them up first; only raise this if splitting truly does not work. |
+| `BG_LIST_CACHE_TTL_MS` | `5000` | How long the job list cache lives (legacy knob). | Never. Kept for compatibility. |
+| `BG_NOTIFY_DEFAULT` | `true` | New jobs announce their finish by default. `false` = new jobs stay quiet by default (results still saved to file + log). | You want quiet by default and will check results yourself. You can still override per job (see below). |
+| `BG_IDLE_CLOSE_MS` | `180000` (3 minutes) | How long a job may sit with zero sign of life before the reaper closes it as stale. SneaX's number. | Jobs are wrongly closed while still working (raise it), or dead jobs linger too long (lower it). Garbage/zero/negative falls back to 3 minutes. |
+| `BG_WAKE_NOTE` | `true` (ON) | Whether a finished job wakes your session with a message. ON = you get woken and told. `false` = no wake message at all — you check yourself via the list, popup, and logs below. | Turn it OFF (`false`) when you want zero interruptions and prefer to poll. |
+
+Three precedence rules worth knowing:
+
+- Setting `notify_on_complete:false` on one job beats `BG_NOTIFY_DEFAULT=true` for that job only.
+- Setting `BG_NOTIFY_DEFAULT=false` makes all *new* jobs quiet by default — but results are still saved to file + log, so nothing is lost.
+- Setting `BG_WAKE_NOTE=false` kills only the wake message. The popup, DONE markers, file log, and app log keep working.
+
+---
+
+## Daily use — the 7 tools
+
+You type these inside your session. `id` is the job id you got back when you
+started the job.
+
+**Start a background research/agent job:**
+
+```
+background_run(kind="task", prompt="Summarize the repo layout")
+```
+
+It returns an id immediately — keep working, you will be woken when it lands.
+
+**Start a background shell job:**
+
+```
+background_run(kind="bash", prompt="npm test 2>&1 | tail -20")
+```
+
+**Start a quiet job (this job only, no announcements):**
+
+```
+background_run(kind="bash", prompt="long job", notify_on_complete=false)
+```
+
+**See everything at a glance:**
+
+```
+background_list()
+```
+
+Finished jobs show `[DONE …]` markers here — that is how you spot
+completions when quiet mode is on.
+
+**Read the full result:**
+
+```
+background_read(id="<job-id>")
+```
+
+While the job is still running this says `[running]` — it never blocks.
+
+**Check whether a job is alive right now:**
+
+```
+background_status(id="<job-id>")
+```
+
+Instant, never blocks. Shows heartbeat age — how long since the job showed
+a sign of life.
+
+**Nudge a running agent job (max 5 nudges, deadline never moves):**
+
+```
+background_steer(id="<job-id>", instruction="Also cover the API layer")
+```
+
+**Stop a job (whatever it produced so far is kept):**
+
+```
+background_stop(id="<job-id>")
+```
+
+**Print the live build + setting names (read-only, changes nothing):**
+
+```
+background_config()
+```
+
+Two guardrails you may bump into: you cannot start background jobs from
+*inside* a background job (it tells you to do the work directly — this
+prevents runaway spawning), and only the session that started a job can
+read/steer/stop it (anyone can still see it in the list).
+
+---
+
+## What you will see when a job finishes
+
+There are four shapes. The first two are the ones you will notice; the last
+two are logs that always fire even when everything else is silenced.
+
+**1. A popup toast (small notification in your terminal UI).** Exact words:
+
+| What happened | What the toast says |
+|---------------|---------------------|
+| It finished fine | `✓ done, darling: <id> landed clean` |
+| It failed | `✗ broke, honey: <id> exit <code> — come look` (or `— come look` without a code) |
+| It ran out of time | `⏱ too slow, darling: <id> timed out` |
+| You (or the reaper) stopped it | `■ put down: <id> killed on order` |
+
+**2. A wake message in your session + the assistant reports.**
+Your session takes a turn on its own: it reads the result and tells you
+about it in its own words, unprompted. That unprompted turn is the designed
+behavior, not a bug — arrival equals action. If you set
+`BG_WAKE_NOTE=false`, this message never comes (zero trace in your session);
+you check the list, popups, and logs instead.
+
+**3. A `[DONE …]` marker in `background_list()`.**
+Finished jobs get `[DONE COMPLETED]`, `[DONE FAILED]`, or `[DONE STOPPED]`
+stuck on the front of their summary. This marker is load-bearing — the
+assistant and the wake logic key off it. Never rename or strip it.
+
+**4. Two log lines that always fire, even in quiet mode.**
+A per-project JSON-lines file (`.notifications.log` under
+`~/.local/share/opencode/background-ops/`) and a structured event in the
+host `app.log` (service `background-ops`). Quiet mode silences shapes 1–3;
+it never silences these two.
+
+---
+
+## Troubleshooting
+
+**You edited the file but nothing changed — stale runtime.**
+New shell ≠ restart. The plugin loads at server boot only. Copy the file
+live, reboot the server, then run `background_config()` and check the
+banner says `v2.2.0-r7-turn-firing`. Anything older = you are still on the
+old build.
+
+**Your jobs finish silently — nobody tells you.**
+Check two switches: per-job `notify_on_complete:false` silences that one
+job; `BG_NOTIFY_DEFAULT=false` silences all *new* jobs by default. Check
+`BG_WAKE_NOTE=false` — that one kills the wake message entirely while
+leaving popup + DONE + logs + polling alive. Results are never lost: look
+in `background_list()` for `[DONE …]` markers, or read the
+`.notifications.log` / `app.log` lines.
+
+**A job timed out (`⏱ too slow…`).**
+It ran past its deadline (cap: `BG_MAX_TIMEOUT_MINUTES`, default 48h).
+Whatever it produced so far is kept — read it with `background_read`, then
+start a fresh run for the remainder. Nudging a job (`background_steer`)
+never extends its deadline.
+
+**A job was closed as stale by the reaper.**
+The reaper closes a job only when *both* prove silence for
+`BG_IDLE_CLOSE_MS` (default 3 minutes): no heartbeat *and* no child/output
+activity, checked about once a minute. Any doubt = no close, retry next
+sweep. If good jobs keep getting reaped, raise `BG_IDLE_CLOSE_MS`. Reaped
+closes are routine and quiet by design (log line only, never red).
+
+**Something is broken and you want yesterday back — rollback.**
+Every deploy to the live folder takes a backup first into `backups/` (and
+the repo history has every version). Roll back = copy the backup file back
+over `~/.config/opencode/plugins/background.ts` + reboot the server.
+Nothing else. Never store backups inside `plugins/` — opencode auto-loads
+*every* `.ts` file in there, and one pileup once cost a full night.
+
+---
+
+# History — the full project book (base `6cb35dc` on `4ad4612`, kept as back matter)
+
+Everything below is the complete book as it stood at `6cb35dc`
+(404 lines, live build `2.2.0-r7-turn-firing`, commit `4ad4612`). It was
+written for the AI and the builders; it is kept here verbatim so no
+decision, layer, or lesson is lost. New readers: the operator guide above
+is the manual — this is the archive.
+
+---
+
+## H1. What it is
 
 opencode runs one thing at a time in the foreground.
 background-ops adds the background:
@@ -25,18 +255,18 @@ Delivery has five roads, so no single failure loses a result:
 
 | # | Road | Where | Notes |
 |---|------|-------|-------|
-| A | Wake note | parent session transcript | turn-firing reply (see §5) |
-| B | Toast | TUI popup | SneaX-voice strings, see §6 |
+| A | Wake note | parent session transcript | turn-firing reply (see H5) |
+| B | Toast | TUI popup | SneaX-voice strings, see H6 |
 | C | DONE marker | `background_list` summaries + persisted output | `[DONE STATE]` prefix, load-bearing |
 | D | `.notifications.log` | per-project dir under `~/.local/share/opencode/background-ops/` | JSON-lines, infallible |
 | E | `app.log` | host log service `background-ops` | structured event, infallible |
 
 Roads D + E fire **even when the kill-switch is off**.
-Roads A + B + C fire only when `shouldNotify` allows (see §7).
+Roads A + B + C fire only when `shouldNotify` allows (see H7).
 
 ---
 
-## 2. The 7 tools
+## H2. The 7 tools
 
 | Tool | Purpose |
 |------|---------|
@@ -67,7 +297,7 @@ If the banner says anything older, the server hasn't rebooted onto this build ye
 
 ---
 
-## 3. Config — every `BG_` var
+## H3. Config — every `BG_` var
 
 | Var | Default | Purpose |
 |-----|---------|---------|
@@ -89,7 +319,7 @@ Precedence that matters:
 
 ---
 
-## 4. Version history — every layer, with SHAs
+## H4. Version history — every layer, with SHAs
 
 Base under the book: `4ad4612`. All on `main`, single-branch, repo-first.
 
@@ -101,7 +331,7 @@ Base under the book: `4ad4612`. All on `main`, single-branch, repo-first.
 | r4 wake-on-finish | `6f72ee2` | Natural completed/failed **reply-wake** on the parent; stops stay quiet. The "reply road": `promptAsync` on `rootSessionID` **without** `noReply`. |
 | r5-silent (zero-red toast-only) | `e65e77f` | Deleted terminal stderr + parent injection. Toast-only, DONE + logs + polling only. **Over-cut:** it also deleted the parent wake roads — the ping was never supposed to go, only the red. Lesson logged, corrected in r6. |
 | r6 quiet-wake restore | `81b6342` (+53/−36) | Parent quiet wake restored: `promptAsync` with `noReply:true` (context-only, no model turn, no chat). Zero-red kept. All r5 surfaces kept. |
-| r6b SneaX voice | `9a22b16` (+16/−7) | Toast + log wording in SneaX's voice (§6). DONE prefix byte-identical. First attempt `20b66c5b` hit the nested-run guard; retry `53de2edc` via the proven child-subagent pattern succeeded. |
+| r6b SneaX voice | `9a22b16` (+16/−7) | Toast + log wording in SneaX's voice (H6). DONE prefix byte-identical. First attempt `20b66c5b` hit the nested-run guard; retry `53de2edc` via the proven child-subagent pattern succeeded. |
 | r6 hardening (M1 + L1/L2/L3) | `f1eb5ab` (+87/−21) | M1 Untrusted fence + single-line cap on wake/DONE/list. L1 owner gate fail-closed. L2 immutable `deadlineAt` + `MAX_STEERS=5` + state-derived timeout label. L3 `0o700`/`0o600` + `hardenPerms`. Security gate `047e9287`: APPROVED_WITH_CONDITIONS, 0C/0H/0M/2L. |
 | R1 fence | `3d86477` (+7/−3) | M1-pattern fence on `list` / `status` / running-`read`: untrusted summaries framed, single-lined. No re-gate needed (LOW fast-follow per gate terms). |
 | r6c kill-switch | `e4009d3` | `BG_WAKE_NOTE` gate, default OFF at birth: OFF = skip wake `promptAsync` entirely (zero residue); ON = r6b bytes exactly. Paint-trigger documented: **any** `promptAsync` persists a message row the TUI paints — only *skip* gives zero residue. |
@@ -112,7 +342,7 @@ Base under the book: `4ad4612`. All on `main`, single-branch, repo-first.
 
 ---
 
-## 5. The four wake builds — the saga, so it's never built a fifth time
+## H5. The four wake builds — the saga, so it's never built a fifth time
 
 **Build 1 — r4 loud reply (`6f72ee2`).**
 Natural completion woke the parent with a full reply `promptAsync`.
@@ -120,7 +350,7 @@ It worked: the parent acted on arrival. But it rode alongside red stderr noise.
 
 **Build 2 — r5 silent (`e65e77f`).**
 Killed the red AND the wake in one cut. Toast-only, zero parent injection.
-Live-proven with SneaX eyes on the TUI (probes A–D, §9): green-only toasts,
+Live-proven with SneaX eyes on the TUI (probes A–D, H9): green-only toasts,
 error-toast-only failures, silent timeouts/stops. Silence *was* the pass —
 but the ping Mavis needs was gone with it. SneaX: the ping was never supposed to go.
 
@@ -128,7 +358,7 @@ but the ping Mavis needs was gone with it. SneaX: the ping was never supposed to
 Restored the wake as context-only `noReply:true`: auto-turn + auto-read,
 `204 void`, no chat, no model turn, no abort. Then voice (`9a22b16`),
 hardening (`f1eb5ab`), R1 (`3d86477`), kill-switch (`e4009d3`),
-voice-match + default ON (`47d9b7c`). Full gate history in §8.
+voice-match + default ON (`47d9b7c`). Full gate history in H8.
 
 **Build 4 — r7 turn-firing (`4ad4612`, live).**
 The quiet wake never took a model turn — and that was the flaw:
@@ -152,7 +382,7 @@ Three lessons, paid for in full:
 
 ---
 
-## 6. Every feature
+## H6. Every feature
 
 **Toast-only, zero-red.**
 No terminal-state `console.error` on any state
@@ -253,7 +483,7 @@ code. `console.error` = true-error catches only.
 
 ---
 
-## 7. Standing decisions and why
+## H7. Standing decisions and why
 
 | Decision | Why |
 |----------|-----|
@@ -270,7 +500,7 @@ code. `console.error` = true-error catches only.
 
 ---
 
-## 8. Gates (security, static)
+## H8. Gates (security, static)
 
 | Gate | Verdict |
 |------|---------|
@@ -285,7 +515,7 @@ re-opens the gate.
 
 ---
 
-## 9. Live proof recipe (SneaX protocol)
+## H9. Live proof recipe (SneaX protocol)
 
 Proven on r5-silent with SneaX eyes on the TUI; same probes re-run per build:
 
@@ -305,7 +535,7 @@ B-timeout `0d778dac`/`1f1b73cc`/`901c20aa`, B-manual `9663ab5b`. SneaX: "good ev
 
 ---
 
-## 10. Rollback map
+## H10. Rollback map
 
 - Every disk deploy takes a backup first (per-deploy copies, `backups/` dir).
 - Deploys are disk-only copies of the single file; the repo is authority.
@@ -316,7 +546,7 @@ B-timeout `0d778dac`/`1f1b73cc`/`901c20aa`, B-manual `9663ab5b`. SneaX: "good ev
 
 ---
 
-## 11. Install
+## H11. Install
 
 1. Copy the single file live:
 
@@ -346,7 +576,7 @@ Requires `@opencode-ai/plugin` (already present in standard configs).
 
 ---
 
-## 12. Usage
+## H12. Usage
 
 Launch a background subagent task:
 
