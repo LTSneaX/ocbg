@@ -58,6 +58,9 @@ function cleanSingleLine(s: string): string {
 }
 // L2: steers never extend the run past its original deadline.
 const MAX_STEERS = 5;
+// Phase-2 timeout policy: per-job default 24h (long jobs survive the night);
+// ceiling stays 48h via CONFIG.maxTimeoutMinutes; explicit overrides win.
+const DEFAULT_TIMEOUT_MINUTES = 1440;
 const ADJ = ["swift", "quiet", "bright", "calm", "bold", "keen", "warm", "cool"];
 const COLOR = ["amber", "jade", "cobalt", "crimson", "slate", "violet", "emerald", "onyx"];
 const ANIMAL = ["falcon", "otter", "wolf", "heron", "fox", "badger", "lynx", "wren"];
@@ -883,12 +886,12 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     description: "Run a task subagent OR bash command in background. Returns readable id immediately. Noisy by default (DONE markers in background_list when notify_on_complete, default true). Use background_read to get full results.",
     args: {
       kind: tool.schema.enum(["task", "bash"]).describe("task=subagent, bash=shell"), prompt: tool.schema.string().describe("Task prompt OR shell command"),
-      agent: tool.schema.string().optional().describe("Subagent name"), timeout_minutes: tool.schema.number().optional().describe("Max runtime minutes, default 15"),
+      agent: tool.schema.string().optional().describe("Subagent name"), timeout_minutes: tool.schema.number().optional().describe("Max runtime minutes, default 1440 (24h)"),
       model: tool.schema.string().optional().describe("Model override"), notify_on_complete: tool.schema.boolean().optional().describe("Default true (BG_NOTIFY_DEFAULT env)"),
     },
     async execute(args, ctx) {
       const kind = args.kind as Kind;
-      let timeout = args.timeout_minutes ?? 15;
+      let timeout = args.timeout_minutes ?? DEFAULT_TIMEOUT_MINUTES;
       if (timeout <= 0 || timeout > CONFIG.maxTimeoutMinutes) timeout = CONFIG.maxTimeoutMinutes;
       if (kind === "bash") validateBashCommand(args.prompt);
       const cwd = ctx.directory || directory, id = genId(), dir = baseDir(cwd);

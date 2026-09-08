@@ -91,7 +91,7 @@ Two rules: plugins load at server boot only (a new file on disk means nothing un
 
 | Tool | Use it when | Key params |
 |---|---|---|
-| `background_run` | Start a subagent task or shell command without blocking | `kind` (`task`/`bash`), `prompt`, `timeout_minutes` (default 15), `notify_on_complete` (default true) |
+| `background_run` | Start a subagent task or shell command without blocking | `kind` (`task`/`bash`), `prompt`, `timeout_minutes` (default 1440 = 24h), `notify_on_complete` (default true) |
 | `background_list` | See every job: id, kind, state, one-line summary | — |
 | `background_status` | Check live jobs: heartbeat age, current step, concurrency | `id` (optional; omit for all running) |
 | `background_read` | Get the full persisted result of a finished job | `id` |
@@ -124,7 +124,7 @@ Lifecycle: `run` → live heartbeats per step → terminal funnel (completed / f
 - **Persistence.** Each job keeps a Markdown result, a JSON state record, and a heartbeat trail under `~/.local/share/opencode/background-ops/<project>/`, plus one shared `.notifications.log` per project. Finished results stay readable by id. Terminal results older than `BG_RETENTION_DAYS` (default 7) are pruned; both append-only logs keep the most recent 200 lines.
 - **Idle reaper.** About every 60 seconds a sweep checks running jobs. A job closes only when *both* its heartbeat *and* its child/output activity prove silence for the idle window (default 3 minutes). Any doubt skips to the next sweep; a genuine completion that lands mid-sweep always wins.
 - **Guards.** Reading, steering, and stopping a job are restricted to the session that created it (anything else gets a fail-closed not-found); lists and status stay visible from any session by design. Deadlines are immutable with a 5-steer cap. Job files are written with private permissions (0700 dirs, 0600 files). Untrusted child output is single-line capped and framed before it reaches summaries or wake text. Starting a background run from inside a background child is rejected — do the work directly instead.
-- **Limits.** 10 concurrent jobs (extras queue), 15-minute default timeout (cap 48 hours), 4096-byte shell command cap, random unguessable ids by default.
+- **Limits.** 10 concurrent jobs (extras queue), 24-hour default timeout (cap 48 hours via `BG_MAX_TIMEOUT_MINUTES`; explicit `timeout_minutes` overrides win), 4096-byte shell command cap, random unguessable ids by default.
 
 Details: `docs/internals.md`.
 

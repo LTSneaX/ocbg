@@ -132,6 +132,52 @@ describe("G4 deadline + steer", () => {
     expect(readNotifications(home, t.dir).find((n: any) => n.id === t.id)?.event).toBe("timeout");
   });
 
+  it("default timeout is 24h (1440m): timeoutMinutes + deadlineAt window", async () => {
+    const t = await pendingTask(); // no timeout_minutes => code default
+    const st = readState(home, t.dir, t.id);
+    expect(st.timeoutMinutes).toBe(1440);
+    expect(typeof st.deadlineAt).toBe("number");
+    expect(typeof st.startedAt).toBe("number");
+    expect(st.deadlineAt - st.startedAt).toBe(1440 * 60000);
+    await t.plugin.tool.background_stop.execute({ id: t.id }, t.owner); // cleanup
+  });
+
+  it("explicit overrides win: short honored, over-ceiling clamped to 48h", async () => {
+    const dir = makeWorkdir();
+    const client = makeClient();
+    const plugin = await boot({ dir, client });
+    const owner = makeCtx(OWNER, dir);
+    const shortId = runId(
+      await plugin.tool.background_run.execute({ kind: "task", prompt: "quick", timeout_minutes: 60 }, owner),
+    );
+    const short = readState(home, dir, shortId);
+    expect(short.timeoutMinutes).toBe(60);
+    expect(short.deadlineAt - short.startedAt).toBe(60 * 60000);
+    const bigId = runId(
+      await plugin.tool.background_run.execute({ kind: "task", prompt: "huge", timeout_minutes: 99999 }, owner),
+    );
+    const big = readState(home, dir, bigId);
+    expect(big.timeoutMinutes).toBe(2880); // BG_MAX_TIMEOUT_MINUTES ceiling
+    expect(big.deadlineAt - big.startedAt).toBe(2880 * 60000);
+    await plugin.tool.background_stop.execute({ id: shortId }, owner);
+    await plugin.tool.background_stop.execute({ id: bigId }, owner);
+  });
+
+  it("steer never extends a default-24h deadline", async () => {
+    const t = await pendingTask();
+    const before = readState(home, t.dir, t.id);
+    expect(before.timeoutMinutes).toBe(1440);
+    const res = String(
+      await t.plugin.tool.background_steer.execute({ id: t.id, instruction: "keep going" }, t.owner),
+    );
+    expect(res).toContain(`Steered ${t.id}`);
+    expect(res).toContain("timeout window NOT extended");
+    const after = readState(home, t.dir, t.id);
+    expect(after.deadlineAt).toBe(before.deadlineAt);
+    expect(after.startedAt).toBe(before.startedAt);
+    await t.plugin.tool.background_stop.execute({ id: t.id }, t.owner); // cleanup
+  });
+
   it("plain manual stop labels stopped, never timeout", async () => {
     const t = await pendingTask();
     await t.plugin.tool.background_stop.execute({ id: t.id }, t.owner);

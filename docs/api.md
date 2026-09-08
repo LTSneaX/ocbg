@@ -11,7 +11,7 @@ Launch a `task` subagent or `bash` job. Returns the id immediately — never blo
 | `kind` | `"task"` \| `"bash"` | yes | `task` = subagent, `bash` = shell |
 | `prompt` | string | yes | Task prompt OR shell command (bash capped at `BG_MAX_BASH_BYTES`) |
 | `agent` | string | no | Subagent name |
-| `timeout_minutes` | number | no | Default 15; clamped to `BG_MAX_TIMEOUT_MINUTES`; `0` = none where honored; steer never extends it |
+| `timeout_minutes` | number | no | Default 1440 (24h); clamped to `BG_MAX_TIMEOUT_MINUTES` (48h); `0` = none where honored; steer never extends it |
 | `model` | string | no | Model override |
 | `notify_on_complete` | boolean | no | Default true (`BG_NOTIFY_DEFAULT`); `false` = this job stays quiet (result still saved) |
 

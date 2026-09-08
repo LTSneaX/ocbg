@@ -28,3 +28,5 @@ BG_WAKE_NOTE=true
 ```
 
 Precedence: per-job `notify_on_complete:false` beats `BG_NOTIFY_DEFAULT=true` for that job; `BG_NOTIFY_DEFAULT=false` quiets new jobs by default; `BG_WAKE_NOTE=false` kills only the wake message — popups, DONE markers, both logs keep firing.
+
+Per-job timeout policy: `background_run` defaults to `timeout_minutes: 1440` (24h) when omitted — long jobs survive the night. Explicit values win (short or long), clamped to `BG_MAX_TIMEOUT_MINUTES` (`2880` = 48h). Steer never extends the deadline.
