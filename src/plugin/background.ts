@@ -125,6 +125,50 @@ function saveJob(job: Job) {
 function persistOutput(job: Job, body: string) {
   writeFileSync(job.outputPath, `# ${job.title}\n\n- id: ${job.id}\n- kind: ${job.kind}\n- state: ${job.state}\n- started: ${new Date(job.startedAt).toISOString()}\n${job.endedAt ? `- ended: ${new Date(job.endedAt).toISOString()}\n` : ""}- summary: ${job.summary}\n\n---\n\n${body}`, { mode: 0o600 }); // L3
 }
+// F1: trailing-edge debounce window for bash persistOutput (250-500ms per
+// review: 300ms). Chunks arrive per data event; without coalescing every chunk
+// pays chunks.join("") + a full synchronous file rewrite (O(n^2) over output).
+// One pending timer covers every chunk inside the window; the close handler
+// cancels it and performs the guaranteed final write (flush-on-close), so no
+// byte is ever lost and no trailing write can clobber the terminal output.
+export const BASH_PERSIST_DEBOUNCE_MS = 300;
+export interface TrailingDebouncer { schedule(): void; cancel(): void; flush(): void; }
+function unrefTimer(t: ReturnType<typeof setTimeout>): void {
+  try {
+    const maybe = t as unknown as { unref?: unknown };
+    if (typeof maybe.unref === "function") (maybe as { unref: () => void }).unref();
+  } catch { /* best-effort: never break the caller */ }
+}
+export function createTrailingDebouncer(waitMs: number, fn: () => void): TrailingDebouncer {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const schedule = (): void => {
+    if (timer !== null) return; // a pending trailing write already covers this push
+    timer = setTimeout(() => { timer = null; fn(); }, waitMs);
+    if (timer !== null) unrefTimer(timer); // never hold the host process open
+  };
+  const cancel = (): void => {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+  };
+  const flush = (): void => { cancel(); fn(); };
+  return { schedule, cancel, flush };
+}
+// F2/A3 bounds for the list/status pre-render refresh: skip re-polling a task
+// job whose heartbeat proves a poll already ran within the window, and cap
+// every per-job refresh so one hung child lookup never stalls the render.
+const REFRESH_FRESH_SKIP_MS = 60_000;
+const REFRESH_PER_JOB_TIMEOUT_MS = 5_000;
+// Prefix of the heartbeat step startTask writes at dispatch. A job whose last
+// step is still the dispatch step has NEVER been polled: the first list/status
+// must always poll it (prompt completion surfacing + timeout enforcement).
+const TASK_DISPATCH_STEP_PREFIX = "task dispatched";
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  const gate = new Promise<T>((_, reject) => {
+    t = setTimeout(() => reject(new Error("background: per-job refresh timeout")), ms);
+    if (t !== undefined) unrefTimer(t);
+  });
+  return Promise.race([p.finally(() => { if (t !== undefined) clearTimeout(t); }), gate]);
+}
 const jobs = new Map<string, Job>();
 const procs = new Map<string, ChildProcess>();
 const childSessions = new Set<string>();
@@ -170,6 +214,45 @@ function readHeartbeatAgeMs(job: Job): number | null {
     if (Number.isNaN(t)) return null;
     return Date.now() - t;
   } catch { return null; }
+}
+// F2/A3: single-read heartbeat freshness probe for the list/status skip gate.
+// Returns the numeric age AND the last step together (one file read instead of
+// two). Null age = missing/unparseable heartbeat (caller must poll: the first
+// poll is still owed). Negative age = clock skew (treat as fresh). Never throws.
+function readHeartbeatFresh(job: Job): { ageMs: number | null; step: string | null } {
+  try {
+    const lines = readFileSync(heartbeatPath(job), "utf8").split("\n").filter(Boolean);
+    if (!lines.length) return { ageMs: null, step: null };
+    const last = lines[lines.length - 1];
+    const i = last.indexOf(" | ");
+    if (i < 0) return { ageMs: null, step: null };
+    const t = new Date(last.slice(0, i)).getTime();
+    return { ageMs: Number.isNaN(t) ? null : Date.now() - t, step: last.slice(i + 3) };
+  } catch { return { ageMs: null, step: null }; }
+}
+// F2/A3: true when a running task job may skip its pre-render network poll.
+// Skips ONLY when (a) a poll demonstrably ran already (last step is not the
+// dispatch step — the first list after dispatch must always poll, otherwise
+// prompt completions would hide for a full window), (b) that poll is fresh
+// (<60s, skew counts as fresh), and (c) the deadline has not passed (timeout
+// enforcement lives inside refreshTaskJob — a past-deadline job must poll so
+// list/status still enforces the timeout promptly). Bash jobs are never
+// skippable (sync + cheap, and they own bash timeout enforcement). Never throws.
+function taskRefreshSkippable(job: Job): boolean {
+  try {
+    if (job.kind !== "task" || job.state !== "running" || !job.childSessionID) return false;
+    if (job.timeoutMinutes > 0) {
+      const pastDeadline = job.deadlineAt !== undefined
+        ? Date.now() >= job.deadlineAt
+        : (Date.now() - job.startedAt) / 60000 > job.timeoutMinutes;
+      if (pastDeadline) return false;
+    }
+    const hb = readHeartbeatFresh(job);
+    if (hb.ageMs === null || hb.step === null) return false;
+    if (hb.step.startsWith(TASK_DISPATCH_STEP_PREFIX)) return false;
+    if (hb.ageMs < 0) return true;
+    return hb.ageMs < REFRESH_FRESH_SKIP_MS;
+  } catch { return false; }
 }
 // Bash activity signal: .md output-file mtime. Returns true ONLY when the output
 // provably shows no writes within idleCloseMs. Fresh mtime, clock skew (negative
@@ -264,10 +347,19 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     job.pid = child.pid; procs.set(job.id, child); saveJob(job);
     writeHeartbeat(job, `bash spawned (pid=${child.pid})`);
     const chunks: string[] = [`$ ${job.prompt}\n`];
-    const writeOut = () => { try { persistOutput(job, chunks.join("")); } catch { /* best-effort: never throw from EventEmitter handler */ } };
-    child.stdout?.on("data", (d) => { chunks.push(String(d)); writeOut(); });
-    child.stderr?.on("data", (d) => { chunks.push(`[stderr] ${String(d)}`); writeOut(); });
+    // F1: trailing-edge persist — schedule() coalesces the whole chunk storm
+    // into one write per window instead of one full rewrite per chunk.
+    const persistSoon = createTrailingDebouncer(BASH_PERSIST_DEBOUNCE_MS, () => {
+      try { persistOutput(job, chunks.join("")); } catch { /* best-effort: never throw from EventEmitter handler */ }
+    });
+    child.stdout?.on("data", (d) => { chunks.push(String(d)); persistSoon.schedule(); });
+    child.stderr?.on("data", (d) => { chunks.push(`[stderr] ${String(d)}`); persistSoon.schedule(); });
     child.on("close", (code) => {
+      // Flush-on-close: cancel the pending trailing write (it is subsumed by
+      // the final write below, which must win — a late trailing write must
+      // never clobber the terminal output). Every byte is preserved: Node
+      // delivers all stdio data events before 'close'.
+      persistSoon.cancel();
       chunks.push(`\n[exit code ${code}]`);
       const done = jobs.get(job.id) ?? job;
       if (done.state === "running") {
@@ -625,6 +717,31 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
   // holds the process open on its own.
   const idleReaperTimer = setInterval(() => { sweepIdleJobs().catch(() => { /* per-job logging already handled */ }); }, IDLE_SWEEP_INTERVAL_MS);
   (idleReaperTimer as any)?.unref?.();
+  // F2/A3: bounded parallel pre-render refresh shared by background_list and
+  // background_status. Replaces the old serial per-job await loop: every
+  // running job refreshes CONCURRENTLY via Promise.allSettled (latency drops
+  // from sum(RTT) to max(RTT)), each task poll is capped by a per-job timeout
+  // (one hung child lookup resolves the render instead of stalling it — a late
+  // refresh landing afterwards is still safe via the CAS guards), and task
+  // jobs with a fresh post-poll heartbeat skip the network re-poll entirely
+  // (bash jobs always refresh: sync, cheap, and they own bash timeout
+  // enforcement). Render order is unaffected: allSettled preserves input order
+  // and the render sorts via allKnownJobsFresh. Never throws.
+  async function refreshRunningForRender(): Promise<void> {
+    try {
+      const running = [...jobs.values()].filter((j) => j.state === "running");
+      await Promise.allSettled(running.map(async (j) => {
+        try {
+          if (j.kind === "task") {
+            if (taskRefreshSkippable(j)) return;
+            await withTimeout(refreshTaskJob(c, j), REFRESH_PER_JOB_TIMEOUT_MS);
+          } else {
+            refreshBashJob(j);
+          }
+        } catch { /* per-job best-effort: one slow/bad job never breaks the render */ }
+      }));
+    } catch { /* never break list/status rendering */ }
+  }
   const background_run = tool({
     description: "Run a task subagent OR bash command in background. Returns readable id immediately. Noisy by default (DONE markers in background_list when notify_on_complete, default true). Use background_read to get full results.",
     args: {
@@ -663,15 +780,9 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     args: {},
     async execute(_args, ctx) {
       // v2.2.0: refresh running jobs before render so genuinely-done children
-      // surface as completed/failed without waiting for a sweep. Per-job
-      // try/catch: one bad job never breaks the list.
-      for (const j of [...jobs.values()]) {
-        if (j.state !== "running") continue;
-        try {
-          if (j.kind === "task") await refreshTaskJob(c, j);
-          else refreshBashJob(j);
-        } catch { /* per-job best-effort */ }
-      }
+      // surface as completed/failed without waiting for a sweep. F2/A3 bounded
+      // parallel refresh (concurrent + per-job timeout + fresh-heartbeat skip).
+      await refreshRunningForRender();
       const all = allKnownJobsFresh(ctx.directory || directory);
       // R1 fence: list/status/running-read summaries are untrusted child output —
       // single-line + frame as untrusted (M1 cleanSingleLine pattern). NOTE: the
@@ -684,14 +795,9 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     description: "Live status of background jobs with heartbeat age + current step (instant, never blocks)",
     args: { id: tool.schema.string().optional().describe("Job id, omit for all running") },
     async execute(args, ctx) {
-      // v2.2.0: same pre-render refresh as background_list (per-job try/catch).
-      for (const j of [...jobs.values()]) {
-        if (j.state !== "running") continue;
-        try {
-          if (j.kind === "task") await refreshTaskJob(c, j);
-          else refreshBashJob(j);
-        } catch { /* per-job best-effort */ }
-      }
+      // v2.2.0: same pre-render refresh as background_list. F2/A3 bounded
+      // parallel refresh (concurrent + per-job timeout + fresh-heartbeat skip).
+      await refreshRunningForRender();
       const all = allKnownJobsFresh(ctx.directory || directory);
       const list = args.id ? all.filter((j) => j.id === args.id) : all.filter((j) => j.state === "running" || j.state === "queued");
       if (!list.length) return args.id ? `No job ${args.id}` : "No running jobs.";
