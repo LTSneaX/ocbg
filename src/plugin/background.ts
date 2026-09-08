@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { spawn, type ChildProcess } from "child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, appendFileSync, chmodSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, appendFileSync, chmodSync, unlinkSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
@@ -18,11 +18,19 @@ function parsePositiveMs(raw: unknown, fallback: number): number {
 // All numeric knobs route through parsePositiveMs: 0/negative/garbage/NaN
 // falls back to the default (never a truthy-negative passthrough, never a
 // queue-bricking 0).
+// F4 retention default: terminal job triples ({id}.json/.md/.heartbeat) older
+// than this many days are pruned. Overridable via BG_RETENTION_DAYS (fractional
+// allowed, e.g. 0.5 = 12h). Running/queued jobs are NEVER pruned.
+export const RETENTION_DEFAULT_DAYS = 7;
+// F4 log cap: the append-only logs (.notifications.log, last-idle.log) keep the
+// most recent N lines — same heartbeat-pattern discipline as MAX_HEARTBEAT_LINES.
+export const MAX_LOG_LINES = 200;
 const CONFIG = {
   maxTimeoutMinutes: parsePositiveMs(process.env.BG_MAX_TIMEOUT_MINUTES, 48 * 60), maxConcurrentJobs: parsePositiveMs(process.env.BG_MAX_CONCURRENT_JOBS, 10),
   jobIdType: (process.env.BG_JOB_ID_TYPE as "uuid" | "counter" | "human") || "uuid", maxBashCommandBytes: parsePositiveMs(process.env.BG_MAX_BASH_BYTES, 4096),
   listCacheTtlMs: parsePositiveMs(process.env.BG_LIST_CACHE_TTL_MS, 5000), notifyDefault: (process.env.BG_NOTIFY_DEFAULT ?? "true") === "true",
   idleCloseMs: parsePositiveMs(process.env.BG_IDLE_CLOSE_MS, IDLE_CLOSE_DEFAULT_MS),
+  retentionDays: parsePositiveMs(process.env.BG_RETENTION_DAYS, RETENTION_DEFAULT_DAYS),
   // BG_WAKE_NOTE kill-switch (default ON): when true (default), terminal states
   // fire the turn-firing reply-mode wake noteText via promptAsync WITHOUT
   // noReply (r4 reply road) — arrival triggers parent action (auto-read +
@@ -293,16 +301,139 @@ function extractSessionActivityMs(raw: any): number | null {
     return best;
   } catch { return null; }
 }
+// ---------------------------------------------------------------------------
+// F3: TTL + dir-mtime list cache. Every background_list/status call used to do
+// a full readdirSync + readFileSync + JSON.parse per historical .json, calling
+// baseDir() (mkdirSync) once for the scan plus once per file. Now: ONE
+// baseDir() per call; on a hit (cached within listCacheTtlMs AND dir mtime
+// unchanged) the disk scan is skipped entirely. In-memory jobs are ALWAYS
+// merged fresh, so same-process transitions never go stale.
+// Dir mtime is the invalidator because entry create/delete bumps it while
+// content-only writes (heartbeat updates, saveJob rewrites, log appends) do
+// NOT — notify traffic never busts the cache, new/pruned job files always do.
+// Staleness is bounded by the TTL (default 5s). Never throws.
+// ---------------------------------------------------------------------------
+interface ListCacheEntry { at: number; dirMtimeMs: number | null; diskJobs: Job[]; }
+const listCache = new Map<string, ListCacheEntry>();
+let diskScanCount = 0;
+// F3 test hooks: the scan counter proves hit/miss behavior through the public
+// surface (same module instance as the booted plugin — no behavior effect).
+export function __getDiskScanCount(): number { return diskScanCount; }
+export function __clearListCache(): void { listCache.clear(); }
+function dirMtimeMs(dir: string): number | null {
+  try {
+    const m = statSync(dir).mtimeMs;
+    return Number.isFinite(m) ? m : null;
+  } catch { return null; }
+}
+// F4: a job is prunable only when terminal AND its end (endedAt; legacy
+// fallback startedAt for records predating the field) is at/past the retention
+// cutoff. Running/queued are never prunable — active-job durability is
+// unconditional.
+function isPrunable(job: Job, cutoff: number): boolean {
+  if (job.state === "running" || job.state === "queued") return false;
+  const ts = job.endedAt ?? job.startedAt;
+  return Number.isFinite(ts) && ts <= cutoff;
+}
+// F4: job ids come from on-disk JSON (same-user but unvalidated) — refuse path
+// separators / parent refs so a crafted record can never delete outside the
+// project dir. Triple paths are derived from the id, never from job.outputPath.
+function safeJobId(id: unknown): id is string {
+  return typeof id === "string" && id.length > 0 && id.length <= 128 && !/[/\\]/.test(id) && !id.includes("..");
+}
+function deleteJobTriple(dir: string, id: string): void {
+  if (!safeJobId(id)) return;
+  for (const name of [`${id}.json`, `${id}.heartbeat`, `${id}.md`]) {
+    try { unlinkSync(join(dir, name)); } catch { /* best-effort per file */ }
+  }
+  // Evict the memory record only when it is the same terminal record — a
+  // concurrent same-id running entry (impossible via genId, defensive anyway)
+  // must never be dropped.
+  const live = jobs.get(id);
+  if (live && live.state !== "running" && live.state !== "queued") jobs.delete(id);
+}
+// F4: heartbeat-pattern cap for the append-only logs (trim to most-recent).
+function trimLogFile(path: string): void {
+  try {
+    if (!existsSync(path)) return;
+    const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+    if (lines.length > MAX_LOG_LINES) writeFileSync(path, lines.slice(-MAX_LOG_LINES).join("\n") + "\n", { mode: 0o600 }); // L3
+  } catch { /* best-effort: never break the host */ }
+}
+function appendLogLine(path: string, line: string): void {
+  try {
+    appendFileSync(path, line, { flag: "a", mode: 0o600 }); // L3
+    trimLogFile(path);
+  } catch { /* never break the host */ }
+}
+// F4: prune terminal job triples older than CONFIG.retentionDays + trim both
+// append-only logs. Running/queued jobs are never touched. Best-effort, never
+// throws; returns pruned ids for observability/tests.
+export function pruneOldJobs(cwd: string, now: number = Date.now()): string[] {
+  const pruned: string[] = [];
+  try {
+    const dir = baseDir(cwd);
+    const cutoff = now - CONFIG.retentionDays * 86400_000;
+    let entries: string[] = [];
+    try { entries = readdirSync(dir); } catch { return pruned; }
+    for (const f of entries) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const j = loadJob(join(dir, f));
+        if (!j || !isPrunable(j, cutoff)) continue;
+        deleteJobTriple(dir, j.id);
+        pruned.push(j.id);
+      } catch { /* per-file best-effort */ }
+    }
+    trimLogFile(join(dir, ".notifications.log"));
+    trimLogFile(join(dir, "last-idle.log"));
+    if (pruned.length) listCache.delete(cwd); // disk changed → drop stale cache
+  } catch { /* never break the host */ }
+  return pruned;
+}
 function allKnownJobsFresh(cwd: string): Job[] {
   const out: Job[] = []; const seen = new Set<string>();
   for (const j of jobs.values()) { out.push(j); seen.add(j.id); }
+  let dir: string;
+  try { dir = baseDir(cwd); } catch { return out.sort((a, b) => b.startedAt - a.startedAt); }
+  const now = Date.now();
+  const mtime = dirMtimeMs(dir);
+  const cached = listCache.get(cwd);
+  if (cached && mtime !== null && cached.dirMtimeMs === mtime && now - cached.at < CONFIG.listCacheTtlMs) {
+    for (const j of cached.diskJobs) {
+      if (seen.has(j.id)) continue;
+      const live = jobs.get(j.id);
+      out.push(live ?? j);
+      if (!live) jobs.set(j.id, j);
+      seen.add(j.id);
+    }
+    return out.sort((a, b) => b.startedAt - a.startedAt);
+  }
+  // Miss: prune expired terminal triples inline (F4 — the scan already pays the
+  // readdir, so retention rides free), then full scan. The log trim caps
+  // pre-existing oversized logs. Mtime is re-read AFTER prune so the cached
+  // entry reflects the post-prune disk state.
+  diskScanCount++;
+  const cutoff = now - CONFIG.retentionDays * 86400_000;
+  const diskJobs: Job[] = [];
   try {
-    for (const f of readdirSync(baseDir(cwd))) {
+    for (const f of readdirSync(dir)) {
       if (!f.endsWith(".json")) continue;
-      const j = loadJob(join(baseDir(cwd), f));
-      if (j && !seen.has(j.id)) { jobs.set(j.id, j); out.push(j); }
+      const j = loadJob(join(dir, f));
+      if (!j) continue;
+      if (isPrunable(j, cutoff)) { deleteJobTriple(dir, j.id); continue; }
+      diskJobs.push(j);
+      if (!seen.has(j.id)) {
+        const live = jobs.get(j.id);
+        out.push(live ?? j);
+        if (!live) jobs.set(j.id, j);
+        seen.add(j.id);
+      }
     }
   } catch { /* empty */ }
+  trimLogFile(join(dir, ".notifications.log"));
+  trimLogFile(join(dir, "last-idle.log"));
+  listCache.set(cwd, { at: now, dirMtimeMs: dirMtimeMs(dir), diskJobs });
   return out.sort((a, b) => b.startedAt - a.startedAt);
 }
 export const BackgroundOps: Plugin = async ({ client, directory }) => {
@@ -482,9 +613,11 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       const toastMsg = live.state === "completed" ? `✓ done, darling: ${live.id} landed clean` : live.state === "failed" ? (exitMatch ? `✗ broke, honey: ${live.id} exit ${exitMatch[1]} — come look` : `✗ broke, honey: ${live.id} — come look`) : isTimeout ? `⏱ too slow, darling: ${live.id} timed out` : `■ put down: ${live.id} killed on order`;
       // --- OPT-4 always-on foundation (emitted even when gated off) ---
       // (i) R4 notification file: JSON-lines append, O_APPEND.
+      // F4: capped append — the log keeps the most recent MAX_LOG_LINES
+      // (heartbeat pattern); always-on durability unchanged.
       try {
         const base = baseDir(live._cwd ?? directory);
-        appendFileSync(join(base, ".notifications.log"), JSON.stringify({ ts: new Date().toISOString(), id: live.id, kind: live.kind, state: live.state, event, cleanEvt, elapsedS, summary: live.summary.slice(0, 120), rootSessionID: live.rootSessionID }) + "\n", { flag: "a", mode: 0o600 }); // L3
+        appendLogLine(join(base, ".notifications.log"), JSON.stringify({ ts: new Date().toISOString(), id: live.id, kind: live.kind, state: live.state, event, cleanEvt, elapsedS, summary: live.summary.slice(0, 120), rootSessionID: live.rootSessionID }) + "\n");
       } catch { /* never break the host */ }
       // (ii) R3 stderr block DELETED in r5-silent, KEPT deleted in r6/r7 (zero-red):
       // no terminal-state console.error on ANY state
@@ -670,6 +803,10 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
   // try/catch + outer try/catch so one bad record can never kill the loop.
   async function sweepIdleJobs() {
     try {
+      // F4: retention rides the 60s sweep cadence (best-effort) so expired
+      // terminal triples + oversized logs are reclaimed even when nobody lists.
+      // Per-cwd stragglers are covered by the list/status miss-path prune.
+      try { pruneOldJobs(directory); } catch { /* best-effort */ }
       for (const job of [...jobs.values()]) {
         try {
           if (job.state !== "running") continue; // never queued/completed/failed/stopped
@@ -870,9 +1007,10 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
         `background-ops v${VERSION}`, "", "--- CONFIG ---",
         `maxTimeoutMinutes:   ${CONFIG.maxTimeoutMinutes}  (env: BG_MAX_TIMEOUT_MINUTES)`, `maxConcurrentJobs:   ${CONFIG.maxConcurrentJobs}  (env: BG_MAX_CONCURRENT_JOBS)`,
         `jobIdType:           ${CONFIG.jobIdType}  (env: BG_JOB_ID_TYPE)`, `maxBashCommandBytes: ${CONFIG.maxBashCommandBytes}  (env: BG_MAX_BASH_BYTES)`,
-        `listCacheTtlMs:      ${CONFIG.listCacheTtlMs}  (env: BG_LIST_CACHE_TTL_MS)`, `notifyDefault:       ${CONFIG.notifyDefault}  (env: BG_NOTIFY_DEFAULT)`,
+        `listCacheTtlMs:      ${CONFIG.listCacheTtlMs}  (env: BG_LIST_CACHE_TTL_MS, TTL list cache + dir-mtime check)`, `notifyDefault:       ${CONFIG.notifyDefault}  (env: BG_NOTIFY_DEFAULT)`,
         `wakeNote:          ${CONFIG.wakeNote}  (env: BG_WAKE_NOTE, default true: ON = turn-firing reply-mode wake-note (parent ACTS on arrival, unprompted); BG_WAKE_NOTE=false skips transcript wake-note promptAsync entirely, delivery via DONE/toast/logs+polling)`,
         `idleCloseMs:        ${CONFIG.idleCloseMs}  (env: BG_IDLE_CLOSE_MS, default 180000 = 3m; override in ~/.config/opencode/.env)`,
+        `retentionDays:      ${CONFIG.retentionDays}  (env: BG_RETENTION_DAYS, default 7: terminal job files older than this are pruned; logs capped at ${MAX_LOG_LINES} lines)`,
         "", "--- Runtime ---",
         `running: ${runningCount()}/${CONFIG.maxConcurrentJobs}`, `queued:  ${queue.length}`, `known:   ${jobs.size}`,
       ].join("\n");
@@ -887,7 +1025,8 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       try {
         const sid = event?.type === "session.idle" ? event?.properties?.sessionID : null;
         if (!sid || !childSessions.has(sid)) return;
-        writeFileSync(join(baseDir(directory), "last-idle.log"), `${new Date().toISOString()} | child idle ${sid}\n`, { flag: "a", mode: 0o600 }); // L3
+        // F4: capped append (heartbeat pattern) — most-recent MAX_LOG_LINES kept.
+        appendLogLine(join(baseDir(directory), "last-idle.log"), `${new Date().toISOString()} | child idle ${sid}\n`);
         // v2.2.0: child went idle → refresh matching running jobs (finalize
         // genuinely-done children) then uniform-notify (v1.2.0 L909-913
         // pattern, routed through notifyJob). Best-effort per job.

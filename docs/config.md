@@ -1,4 +1,4 @@
-# ocbg config — the 8 `BG_` variables
+# ocbg config — the 9 `BG_` variables
 
 > Set in the environment (e.g. `~/.config/opencode/.env`) **before server boot**. Defaults are right for almost everyone — the "When" column says when to touch. Source of truth: `CONFIG` in `src/plugin/background.ts`.
 
@@ -8,7 +8,8 @@
 | `BG_MAX_CONCURRENT_JOBS` | number | `10` | You routinely run >10 and the machine can take it |
 | `BG_JOB_ID_TYPE` | `uuid`\|`counter`\|`human` | `uuid` | Demo only — `counter`/`human` ids are guessable, never in shared projects |
 | `BG_MAX_BASH_BYTES` | number | `4096` | Commands keep getting rejected *and* splitting truly doesn't work |
-| `BG_LIST_CACHE_TTL_MS` | number | `5000` | Never — legacy knob, kept for compat |
+| `BG_LIST_CACHE_TTL_MS` | number | `5000` | Lists feel slow on huge histories (raise) or go stale across hosts (lower); dir-mtime changes always invalidate immediately |
+| `BG_RETENTION_DAYS` | number (days, fractional ok) | `7` | Old terminal results vanish too fast (raise) or disk fills with history (lower) |
 | `BG_NOTIFY_DEFAULT` | boolean | `true` | You want new jobs quiet by default (results still saved) |
 | `BG_IDLE_CLOSE_MS` | ms | `180000` (3m) | Good jobs reaped (raise) or dead jobs linger (lower); garbage/≤0 falls back to 3m |
 | `BG_WAKE_NOTE` | boolean | `true` (ON) | `false` = zero transcript wake, poll via list/toast/logs instead |

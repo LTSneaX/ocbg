@@ -121,7 +121,7 @@ Every finished job emits through one funnel, so natural completions, manual stop
 
 Lifecycle: `run` → live heartbeats per step → terminal funnel (completed / failed / stopped) → uniform notify (logs always, wake + toast + DONE when enabled) → `read` retrieves the persisted result.
 
-- **Persistence.** Each job keeps a Markdown result, a JSON state record, and a heartbeat trail under `~/.local/share/opencode/background-ops/<project>/`, plus one shared `.notifications.log` per project. Finished results stay readable by id.
+- **Persistence.** Each job keeps a Markdown result, a JSON state record, and a heartbeat trail under `~/.local/share/opencode/background-ops/<project>/`, plus one shared `.notifications.log` per project. Finished results stay readable by id. Terminal results older than `BG_RETENTION_DAYS` (default 7) are pruned; both append-only logs keep the most recent 200 lines.
 - **Idle reaper.** About every 60 seconds a sweep checks running jobs. A job closes only when *both* its heartbeat *and* its child/output activity prove silence for the idle window (default 3 minutes). Any doubt skips to the next sweep; a genuine completion that lands mid-sweep always wins.
 - **Guards.** Reading, steering, and stopping a job are restricted to the session that created it (anything else gets a fail-closed not-found); lists and status stay visible from any session by design. Deadlines are immutable with a 5-steer cap. Job files are written with private permissions (0700 dirs, 0600 files). Untrusted child output is single-line capped and framed before it reaches summaries or wake text. Starting a background run from inside a background child is rejected — do the work directly instead.
 - **Limits.** 10 concurrent jobs (extras queue), 15-minute default timeout (cap 48 hours), 4096-byte shell command cap, random unguessable ids by default.
@@ -138,7 +138,8 @@ Set in the environment (e.g. `~/.config/opencode/.env`) **before boot**. Default
 | `BG_MAX_CONCURRENT_JOBS` | `10` | You routinely run more and the machine can take it |
 | `BG_JOB_ID_TYPE` | `uuid` | Demo only — `counter`/`human` ids are guessable, never in shared projects |
 | `BG_MAX_BASH_BYTES` | `4096` | Commands keep getting rejected and splitting truly does not work |
-| `BG_LIST_CACHE_TTL_MS` | `5000` | Never — legacy knob, kept for compatibility |
+| `BG_LIST_CACHE_TTL_MS` | `5000` | Lists feel slow on huge histories (raise) or go stale across hosts (lower); new/pruned job files always invalidate immediately via dir-mtime |
+| `BG_RETENTION_DAYS` | `7` | Old terminal results vanish too fast (raise) or disk fills with history (lower); running/queued jobs are never pruned |
 | `BG_NOTIFY_DEFAULT` | `true` | You want new jobs quiet by default (results are still saved) |
 | `BG_IDLE_CLOSE_MS` | `180000` (3m) | Good jobs get reaped (raise it) or dead jobs linger (lower it); bad values fall back to 3m |
 | `BG_WAKE_NOTE` | `true` | `false` = no transcript wake; poll via list, toasts, and logs instead |
