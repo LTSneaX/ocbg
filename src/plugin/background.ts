@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSy
 import { join } from "path";
 import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
-const VERSION = "2.2.0-r3-red"; // R3-ONLY scratch layer on v2.2.0 bytes: errors-only stderr gate (failed/stopped); successes silent on stderr. EXCLUDES sweep reader, deferreds, wait_seconds, loop text.
+const VERSION = "2.2.0-r4-wake"; // R4 wake delta on v2.2.0-r3-red bytes: natural completed/failed REPLY-WAKE the parent (promptAsync WITHOUT noReply → auto-turn so Mavis auto-reads); stopped/timeout/reaped/queued-removal/manual-stop stay QUIET (noReply:true). EXCLUDES sweep reader, deferreds, wait_seconds, loop text.
 // Default idle window before the reaper may close a silent job: 180000ms = 3m (SneaX's number).
 // SneaX can override in ~/.config/opencode/.env via BG_IDLE_CLOSE_MS=<ms> (garbage/NaN/<=0 falls back to default).
 const IDLE_CLOSE_DEFAULT_MS = 180_000;
@@ -44,7 +44,8 @@ function genId(): string {
 function toParts(text: string): Array<{ type: "text"; text: string }> { return [{ type: "text", text }]; }
 function toModelRef(model?: string): { providerID: string; modelID: string } | undefined {
   const slash = model?.indexOf("/") ?? -1;
-  return slash > 0 ? { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) } : undefined;
+  if (model === undefined || slash <= 0) return undefined;
+  return { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
 }
 function projectId(cwd: string): string { return createHash("sha1").update(cwd).digest("hex").slice(0, 12); }
 function baseDir(cwd: string): string {
@@ -203,8 +204,8 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     persistOutput(job, `[FAILED after ${MAX_TRIES} tries]\n\n${lastError}\n\nRetry backoff used: ${RETRY_DELAYS_MS.join("s, ")}s. What this means: transient dispatch faults (UnknownError at SessionPrompt.createUserMessage via SessionHttpApi.promptAsync) were retried 3× before giving up. If this persists, check model/API availability before re-running.`);
     saveJob(job);
     writeHeartbeat(job, `[FAILED after ${MAX_TRIES} tries] ${lastError.slice(0, 120)}`);
-    // v2.2.0: dispatch-fail is a terminal path → uniform notify (R5 funnel).
-    await notifyJob(c, job);
+    // v2.2.0-r4: dispatch-fail is a NATURAL failure (not a stop) → wake the parent.
+    await notifyJob(c, job, { wake: true });
   }
   function startBash(job: Job) {
     const child = spawn(job.prompt, { shell: "/bin/bash", cwd: job._cwd || directory, detached: false });
@@ -251,9 +252,10 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     saveJob(live);
     procs.delete(live.id);
     pumpQueue();
-    // v2.2.0: manual + reaper stops notify uniformly (R5 funnel). Placed after
-    // pumpQueue to avoid delaying slot release on notifier latency.
-    await notifyJob(c, live);
+    // v2.2.0-r4: manual + reaper stops stay QUIET (wake:false → noReply). Only
+    // natural completions wake. Placed after pumpQueue to avoid delaying slot
+    // release on notifier latency.
+    await notifyJob(c, live, { wake: false });
   }
   // ---------------------------------------------------------------------------
   // v2.2.0: terminal-state funnel (R5). completeJobInternal is the uniform
@@ -261,8 +263,10 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
   // mirroring stopJobInternal's persist/save/pumpQueue tail. stopJobInternal
   // keeps owning the "stopped" path (manual + reaper); completeJobInternal owns
   // "completed"/"failed" (+ timeout-"stopped"). BOTH converge on notifyJob.
-  // Never throws (body wrapped in try/catch): a notifier fault must never
-  // break a terminal transition.
+  // v2.2.0-r4 WAKE RULE: completed/failed → wake=true (reply-triggering parent
+  // injection, auto-turn); stopped (incl. timeout-stopped) → wake=false (quiet
+  // noReply). Never throws (body wrapped in try/catch): a notifier fault must
+  // never break a terminal transition.
   // ---------------------------------------------------------------------------
   async function completeJobInternal(job: Job, state: "completed" | "failed" | "stopped", summary: string, fullBody?: string) {
     try {
@@ -274,7 +278,9 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       saveJob(live);
       procs.delete(live.id);
       pumpQueue();
-      await notifyJob(c, live);
+      // Timeout-stopped via this path (state="stopped") maps to QUIET — only
+      // natural completed/failed wake.
+      await notifyJob(c, live, { wake: state !== "stopped" });
     } catch (e: any) {
       console.error(`[background-ops] completeJobInternal error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
     }
@@ -293,7 +299,16 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
   // + app.log are independent sinks; parent injection is best-effort only.
   // GAP-7: stderr only for host-visible signal — notify-send NOT added
   // (unavailable in headless/server contexts, out of scope).
-  async function notifyJob(client: any, job: Job) {
+  // v2.2.0-r4 WAKE SPLIT: opts.wake=true (natural completed/failed ONLY) →
+  // reply-triggering promptAsync (NO noReply field → model auto-turn so Mavis
+  // auto-reads and continues, Hermes behavior). opts.wake=false (stops,
+  // timeouts, reaps, queued-removal, manual stops; DEFAULT) → noReply:true →
+  // 204 void, context-only, NEVER a default prompt, NEVER aborts the parent.
+  // Single message per job (notified compare-and-set guard preserved);
+  // notify_on_complete/BG_NOTIFY_DEFAULT gate honored on BOTH paths; toast,
+  // DONE marker, file, stderr, app.log behavior identical on both paths.
+  async function notifyJob(client: any, job: Job, opts?: { wake: boolean }) {
+    const wake = opts?.wake === true;
     try {
       const live = jobs.get(job.id) ?? job;
       if (live.state === "running" || live.state === "queued") return; // terminal only: never notify (or burn the single-writer flag) mid-run
@@ -326,11 +341,23 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       // free; if the parent is mid-tool-call the notice waits in its queue
       // (cosmetic ordering risk only) — policy is inject-anyway, never block.
       const note120 = live.summary.slice(0, 120);
-      try {
-        // noReply:true → 204 void, context-only, no model turn, no billed call.
-        // NEVER a default prompt, NEVER aborts the parent.
-        await client?.session?.promptAsync?.({ path: { id: live.rootSessionID }, body: { parts: [{ type: "text", text: `[background-ops] bg ${live.id} [${live.kind}] → ${live.state}: ${note120}. Full output: background_read("${live.id}")` }], noReply: true } })?.catch(() => null);
-      } catch { /* parent gone → skip */ }
+      const noteText = `[background-ops] bg ${live.id} [${live.kind}] → ${live.state}: ${note120}. Full output: background_read("${live.id}")`;
+      if (wake) {
+        // WAKE PATH (natural completed/failed only): reply-triggering injection.
+        // No noReply field → the parent takes a model turn and auto-reads the
+        // result. Single message per job (guard above). Best-effort: parent
+        // gone → skip, never throw, never abort.
+        try {
+          await client?.session?.promptAsync?.({ path: { id: live.rootSessionID }, body: { parts: [{ type: "text", text: noteText }] } })?.catch(() => null);
+        } catch { /* parent gone → skip */ }
+      } else {
+        // QUIET PATH (stops/timeouts/reaps/queued-removal/manual): context-only.
+        try {
+          // noReply:true → 204 void, context-only, no model turn, no billed call.
+          // NEVER a default prompt, NEVER aborts the parent.
+          await client?.session?.promptAsync?.({ path: { id: live.rootSessionID }, body: { parts: [{ type: "text", text: noteText }], noReply: true } })?.catch(() => null);
+        } catch { /* parent gone → skip */ }
+      }
       // GAP-2: toast is TUI-only and headless-no-op; wrapped in try/catch +
       // optional chaining so a missing TUI surface can never throw.
       try {
@@ -542,7 +569,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       jobs.set(job.id, job);
       if (kind === "task") await startTask(job);
       else startBash(job);
-      return { title: `background started: ${id}`, output: `Background ${kind} started: ${id}\nIt completes silently — no popups, no messages. YOU (the agent) own the report: use background_read("${id}") when the result is needed and relay it to the human in your own words.`, metadata: { backgroundId: id, kind } };
+      return { title: `background started: ${id}`, output: `Background ${kind} started: ${id}\nNatural finish auto-wakes the parent session (reply-triggering notice); stops stay quiet. YOU (the agent) own the report: use background_read("${id}") when the result is needed and relay it to the human in your own words.`, metadata: { backgroundId: id, kind } };
     },
   });
   const background_list = tool({
@@ -623,8 +650,8 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
         job.summary = "[STOPPED BY USER] removed from queue.";
         persistOutput(job, job.summary);
         saveJob(job);
-        // v2.2.0: queued-removal is a terminal path → uniform notify (R5 funnel).
-        await notifyJob(c, job);
+        // v2.2.0-r4: queued-removal is a stop-equivalent → QUIET (wake:false).
+        await notifyJob(c, job, { wake: false });
         return `Stopped queued ${args.id}.`;
       }
       if (job.state !== "running") return `Job ${args.id} already ${job.state}.`;
@@ -664,13 +691,13 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
           if (j.childSessionID !== sid || j.state !== "running") continue;
           try {
             await refreshTaskJob(c, j);
-            await notifyJob(c, j); // no-op unless refresh just finalized it
+            await notifyJob(c, j, { wake: false }); // no-op unless refresh just finalized it (already notified with its own wake flag)
           } catch { /* never break the host session */ }
         }
       } catch { /* never break the host session */ }
     },
     "experimental.chat.system.transform": async (_input, output) => {
-      output.system.push(`BACKGROUND OPS v${VERSION}: use background_run(kind="task"|"bash") to launch async work, continue immediately, then background_read(id) when ready. Terminal jobs emit [DONE state] markers in background_list/summary when notify_on_complete (default true); always-on .notifications.log + stderr + app.log; parent session gets best-effort noReply notice. Live heartbeats visible in background_status. YOU own reporting: relay results to the human in your own words. Results persist under ~/.local/share/opencode/background-ops/.`);
+      output.system.push(`BACKGROUND OPS v${VERSION}: use background_run(kind="task"|"bash") to launch async work, continue immediately, then background_read(id) when ready. Terminal jobs emit [DONE state] markers in background_list/summary when notify_on_complete (default true); always-on .notifications.log + stderr + app.log; natural completed/failed REPLY-WAKE the parent (auto-turn); stops/timeouts/reaps stay quiet noReply. Live heartbeats visible in background_status. YOU own reporting: relay results to the human in your own words. Results persist under ~/.local/share/opencode/background-ops/.`);
     },
     "experimental.session.compacting": async (_input, output) => {
       try {
