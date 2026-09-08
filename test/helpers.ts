@@ -24,6 +24,7 @@ export const BG_KEYS = [
   "BG_LIST_CACHE_TTL_MS",
   "BG_IDLE_CLOSE_MS",
   "BG_RETENTION_DAYS",
+  "BG_SWEEP_BUDGET_MS",
   "BG_JOB_ID_TYPE",
 ];
 
