@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSy
 import { join } from "path";
 import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
-const VERSION = "2.2.0-r6-quiet-wake"; // R6 delta on v2.2.0-r5-silent bytes: QUIET-WAKE restore — terminal states (completed/failed/stopped/timeout) send a quiet noReply promptAsync wake (r4 quiet-path bytes, adapted: context-only, 204 void, NO chat message, NO model turn, NEVER aborts parent) so the parent auto-turns/auto-reads the finished result. Zero-red kept (R3 terminal stderr still deleted; true-error catches only). Toast + DONE marker + .notifications.log + app.log + single-writer guard + kill-switch all kept. wake:true = quiet wake; wake:false = fully silent (no injection at all).
+const VERSION = "2.2.0-r6b-sneax-voice"; // r6b delta: SneaX voice toasts (B+C) + clean logs (A); wake/guards/reaper untouched. Base r6 quiet-wake kept — terminal states send quiet noReply promptAsync wake (context-only, 204 void, NO chat, NEVER aborts parent). Zero-red kept (R3 terminal stderr still deleted; true-error catches only). Toast + DONE marker + .notifications.log + app.log + single-writer guard + kill-switch all kept. wake:true = quiet wake; wake:false = fully silent.
 // Default idle window before the reaper may close a silent job: 180000ms = 3m (SneaX's number).
 // SneaX can override in ~/.config/opencode/.env via BG_IDLE_CLOSE_MS=<ms> (garbage/NaN/<=0 falls back to default).
 const IDLE_CLOSE_DEFAULT_MS = 180_000;
@@ -317,11 +317,19 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       live.notified = true; live.unread = true;
       // Gate: per-job opt-out stored at creation from BG_NOTIFY_DEFAULT.
       const shouldNotify = live.notifyOnComplete ?? true;
+      // r6b SneaX voice strings (pure, never throw): shared by .notifications.log + app.log + toast + DONE.
+      const elapsedS = Math.max(0, Math.round(((live.endedAt ?? Date.now()) - live.startedAt) / 1000));
+      const isTimeout = /timeout/i.test(live.summary);
+      const event = live.state === "completed" ? "done" : live.state === "failed" ? "failed" : isTimeout ? "timeout" : "stopped";
+      const cleanEvt = live.state === "completed" ? `done: ${live.id} [${live.kind}] elapsed=${elapsedS}s` : live.state === "failed" ? `failed: ${live.id} [${live.kind}] elapsed=${elapsedS}s` : isTimeout ? `timeout: ${live.id} [${live.kind}] elapsed=${elapsedS}s` : `stopped: ${live.id} [${live.kind}] elapsed=${elapsedS}s`;
+      const cleanMsg = `${cleanEvt} :: ${live.summary.slice(0, 120)}`;
+      const exitMatch = /exit code (-?\d+)/i.exec(live.summary);
+      const toastMsg = live.state === "completed" ? `✓ done, darling: ${live.id} landed clean` : live.state === "failed" ? (exitMatch ? `✗ broke, honey: ${live.id} exit ${exitMatch[1]} — come look` : `✗ broke, honey: ${live.id} — come look`) : isTimeout ? `⏱ too slow, darling: ${live.id} timed out` : `■ put down: ${live.id} killed on order`;
       // --- OPT-4 always-on foundation (emitted even when gated off) ---
       // (i) R4 notification file: JSON-lines append, O_APPEND.
       try {
         const base = baseDir(live._cwd ?? directory);
-        appendFileSync(join(base, ".notifications.log"), JSON.stringify({ ts: new Date().toISOString(), id: live.id, kind: live.kind, state: live.state, summary: live.summary.slice(0, 120), rootSessionID: live.rootSessionID }) + "\n", { flag: "a" });
+        appendFileSync(join(base, ".notifications.log"), JSON.stringify({ ts: new Date().toISOString(), id: live.id, kind: live.kind, state: live.state, event, cleanEvt, elapsedS, summary: live.summary.slice(0, 120), rootSessionID: live.rootSessionID }) + "\n", { flag: "a" });
       } catch { /* never break the host */ }
       // (ii) R3 stderr block DELETED in r5-silent, KEPT deleted in r6 (zero-red):
       // no terminal-state console.error on ANY state
@@ -329,7 +337,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       // quiet-wake + toast + DONE. True-error catches elsewhere kept.
       // (iii) R12 app.log structured event (defensive optional chaining).
       try {
-        await client?.app?.log?.({ body: { service: "background-ops", level: live.state === "failed" ? "error" : "info", message: `bg ${live.id} → ${live.state}: ${live.summary.slice(0, 120)}`, extra: { jobId: live.id, state: live.state } } })?.catch(() => null);
+        await client?.app?.log?.({ body: { service: "background-ops", level: live.state === "failed" ? "error" : "info", message: cleanMsg, extra: { jobId: live.id, state: live.state } } })?.catch(() => null);
       } catch { /* headless / no app.log → skip */ }
       if (!shouldNotify) { saveJob(live); return; } // gated off: still marked notified (no retry storm)
       // --- r6-quiet-wake: parent road is QUIET ONLY (r4 quiet-path bytes) ---
@@ -350,17 +358,18 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       // GAP-2: toast is TUI-only and headless-no-op; wrapped in try/catch +
       // optional chaining so a missing TUI surface can never throw.
       try {
-        await client?.tui?.showToast?.({ body: { message: `bg ${live.id} → ${live.state}: ${live.summary.slice(0, 80)}`, variant: live.state === "failed" ? "error" : "success" } })?.catch(() => null);
+        await client?.tui?.showToast?.({ body: { message: toastMsg, variant: live.state === "failed" ? "error" : "success" } })?.catch(() => null);
       } catch { /* headless → silent no-op */ }
       // DONE marker (v1.2.0 notifyParent L412-415 pattern): prefix summary +
       // prepend marker to persisted output so background_list shows [DONE …].
       try {
         const marker = `[DONE ${live.state.toUpperCase()}]`;
-        live.summary = `${marker} ${live.summary}`;
+        const origSummary = live.summary;
+        live.summary = `${marker} ${toastMsg} :: ${origSummary}`;
         try {
           const raw = readFileSync(live.outputPath, "utf8").replace(/^# .*\n\n(- .*\n)+\n---\n\n/, "");
-          persistOutput(live, `${marker}\n\n${raw}`);
-        } catch { persistOutput(live, `${marker}\n\n${live.summary}`); }
+          persistOutput(live, `${marker} ${toastMsg}\n\n${raw}`);
+        } catch { persistOutput(live, `${marker} ${toastMsg}\n\n${origSummary}`); }
       } catch { /* marker best-effort */ }
       saveJob(live);
     } catch (e: any) {
