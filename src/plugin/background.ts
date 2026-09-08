@@ -21,15 +21,15 @@ function parsePositiveMs(raw: unknown, fallback: number): number {
 // F4 retention default: terminal job triples ({id}.json/.md/.heartbeat) older
 // than this many days are pruned. Overridable via BG_RETENTION_DAYS (fractional
 // allowed, e.g. 0.5 = 12h). Running/queued jobs are NEVER pruned.
-export const RETENTION_DEFAULT_DAYS = 7;
+const RETENTION_DEFAULT_DAYS = 7;
 // F4 log cap: the append-only logs (.notifications.log, last-idle.log) keep the
 // most recent N lines — same heartbeat-pattern discipline as MAX_HEARTBEAT_LINES.
-export const MAX_LOG_LINES = 200;
+const MAX_LOG_LINES = 200;
 // F5: bounded-sweep defaults (overridable: budget via BG_SWEEP_BUDGET_MS).
 // Pool of 3 keeps worst-case session pressure flat; 20s budget keeps every
 // tick short of the 60s sweep cadence with wide margin.
-export const SWEEP_MAX_CONCURRENCY = 3;
-export const SWEEP_BUDGET_MS = 20_000;
+const SWEEP_MAX_CONCURRENCY = 3;
+const SWEEP_BUDGET_MS = 20_000;
 const CONFIG = {
   maxTimeoutMinutes: parsePositiveMs(process.env.BG_MAX_TIMEOUT_MINUTES, 48 * 60), maxConcurrentJobs: parsePositiveMs(process.env.BG_MAX_CONCURRENT_JOBS, 10),
   jobIdType: (process.env.BG_JOB_ID_TYPE as "uuid" | "counter" | "human") || "uuid", maxBashCommandBytes: parsePositiveMs(process.env.BG_MAX_BASH_BYTES, 4096),
@@ -150,7 +150,7 @@ function persistOutput(job: Job, body: string) {
 // One pending timer covers every chunk inside the window; the close handler
 // cancels it and performs the guaranteed final write (flush-on-close), so no
 // byte is ever lost and no trailing write can clobber the terminal output.
-export const BASH_PERSIST_DEBOUNCE_MS = 300;
+const BASH_PERSIST_DEBOUNCE_MS = 300;
 export interface TrailingDebouncer { schedule(): void; cancel(): void; flush(): void; }
 function unrefTimer(t: ReturnType<typeof setTimeout>): void {
   try {

@@ -24,3 +24,6 @@ jobs:
 
       - name: Tests
         run: npm test
+
+      - name: Loader-contract guard
+        run: sh scripts/loader-guard.sh

@@ -4,7 +4,7 @@
 //     content-only writes (heartbeat/save/log appends) do NOT invalidate.
 // F4: pruneOldJobs + the list miss-path prune remove old terminal triples
 //     (.json/.heartbeat/.md), keep recent/running/queued, evict memory, and
-//     cap both append-only logs at MAX_LOG_LINES (most-recent kept).
+//     cap both append-only logs at the log cap (most-recent kept).
 // All through the public tool surface + the exported F3/F4 hooks (same module
 // instance as the booted plugin — re-imported AFTER boot, no reset between).
 
@@ -250,16 +250,23 @@ describe("F4 retention prune", () => {
     expect(String(await plugin.tool.background_list.execute({}, owner))).toContain("ten-day");
   });
 
-  it("default retention is 7 days", async () => {
+  it("default retention is 7 days (tight boundary bracket, no env override)", async () => {
     const dir = makeWorkdir();
     await boot({ dir, client: makeClient() });
     const bg = await bgMod();
-    expect(bg.RETENTION_DEFAULT_DAYS).toBe(7);
-    plantJob(home, dir, "eight-day", { state: "completed", endedAt: Date.now() - 8 * 86_400_000 });
-    plantJob(home, dir, "six-day", { state: "completed", endedAt: Date.now() - 6 * 86_400_000 });
-    expect(bg.pruneOldJobs(dir)).toEqual(["eight-day"]);
+    const DAY = 86_400_000;
+    const now = Date.now();
+    plantJob(home, dir, "eight-day", { state: "completed", endedAt: now - 8 * DAY });
+    plantJob(home, dir, "six-day", { state: "completed", endedAt: now - 6 * DAY });
+    // Tight bracket around the 7-day default: just inside is kept, just
+    // outside is pruned (±60s tolerance, far above any ms-level clock skew).
+    plantJob(home, dir, "almost-seven-day", { state: "completed", endedAt: now - (7 * DAY - 60_000) });
+    plantJob(home, dir, "just-past-seven-day", { state: "completed", endedAt: now - (7 * DAY + 60_000) });
+    expect([...(bg.pruneOldJobs(dir) as string[])].sort()).toEqual(["eight-day", "just-past-seven-day"]);
     expect(tripleExists(home, dir, "eight-day").json).toBe(false);
+    expect(tripleExists(home, dir, "just-past-seven-day").json).toBe(false);
     expect(tripleExists(home, dir, "six-day").json).toBe(true);
+    expect(tripleExists(home, dir, "almost-seven-day").json).toBe(true);
   });
 
   it("terminal job without endedAt falls back to startedAt (legacy records prunable)", async () => {
@@ -300,35 +307,48 @@ describe("F4 log rotation", () => {
     restoreEnv();
   });
 
-  it("oversized logs trim to MAX_LOG_LINES, most-recent kept (both logs)", async () => {
+  it("oversized logs trim to the cap, most-recent kept (both logs)", async () => {
     const dir = makeWorkdir();
     await boot({ dir, client: makeClient() });
     const bg = await bgMod();
-    const cap = bg.MAX_LOG_LINES as number;
-    expect(cap).toBeGreaterThan(0);
     const pd = dirOf(home, dir);
-    const notifLines = Array.from({ length: cap + 50 }, (_, i) => JSON.stringify({ n: i }));
+    // Calibrate the cap behaviorally: an oversized log prunes to exactly cap.
+    const OVER = 500;
+    const notifLines = Array.from({ length: OVER }, (_, i) => JSON.stringify({ n: i }));
     writeFileSync(join(pd, ".notifications.log"), notifLines.join("\n") + "\n", { mode: 0o600 });
-    const idleLines = Array.from({ length: cap + 20 }, (_, i) => `idle-${i}`);
+    const idleLines = Array.from({ length: OVER }, (_, i) => `idle-${i}`);
     writeFileSync(join(pd, "last-idle.log"), idleLines.join("\n") + "\n", { mode: 0o600 });
     bg.pruneOldJobs(dir); // trim path for pre-existing oversized logs
     const notif = logLines(home, dir, ".notifications.log");
+    const cap = notif.length;
+    expect(cap).toBeGreaterThan(0);
+    expect(cap).toBeLessThan(OVER); // the trim actually fired
     const idle = logLines(home, dir, "last-idle.log");
-    expect(notif).toHaveLength(cap);
     expect(idle).toHaveLength(cap);
-    expect(JSON.parse(notif[0]).n).toBe(50); // oldest 50 dropped…
-    expect(JSON.parse(notif[cap - 1]).n).toBe(cap + 49); // …newest kept
-    expect(idle[0]).toBe("idle-20");
-    expect(idle[cap - 1]).toBe(`idle-${cap + 19}`);
+    expect(JSON.parse(notif[0]).n).toBe(OVER - cap); // oldest dropped…
+    expect(JSON.parse(notif[cap - 1]).n).toBe(OVER - 1); // …newest kept
+    expect(idle[0]).toBe(`idle-${OVER - cap}`);
+    expect(idle[cap - 1]).toBe(`idle-${OVER - 1}`);
   });
 
   it("notify append-path trims (one completion caps an oversized notifications log)", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient() });
     const bg = await bgMod();
-    const cap = bg.MAX_LOG_LINES as number;
     const owner = makeCtx(OWNER, dir);
     const pd = dirOf(home, dir);
+    // Calibrate the cap in-test (no cross-test order dep): oversized seed
+    // prunes to exactly cap, then re-seed past it for the append probe.
+    const OVER = 500;
+    writeFileSync(
+      join(pd, ".notifications.log"),
+      Array.from({ length: OVER }, (_, i) => JSON.stringify({ n: i })).join("\n") + "\n",
+      { mode: 0o600 },
+    );
+    bg.pruneOldJobs(dir);
+    const cap = logLines(home, dir, ".notifications.log").length;
+    expect(cap).toBeGreaterThan(0);
+    expect(cap).toBeLessThan(OVER);
     const seed = Array.from({ length: cap + 10 }, (_, i) => JSON.stringify({ n: i }));
     writeFileSync(join(pd, ".notifications.log"), seed.join("\n") + "\n", { mode: 0o600 });
     const id = runId(await plugin.tool.background_run.execute({ kind: "bash", prompt: "echo rot" }, owner));

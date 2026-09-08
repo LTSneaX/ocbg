@@ -26,11 +26,7 @@ import {
   completedMessages,
   staleActivity,
 } from "./helpers.js";
-import {
-  SWEEP_MAX_CONCURRENCY,
-  SWEEP_BUDGET_MS,
-  runBoundedPool,
-} from "../src/plugin/background.js";
+import { runBoundedPool } from "../src/plugin/background.js";
 
 saveEnv();
 
@@ -101,12 +97,28 @@ describe("F5 runBoundedPool (unit, real timers)", () => {
   });
 });
 
-describe("F5 sweep constants", () => {
-  it("pool and budget sit inside their review bands", () => {
-    expect(SWEEP_MAX_CONCURRENCY).toBeGreaterThanOrEqual(1);
-    expect(SWEEP_MAX_CONCURRENCY).toBeLessThanOrEqual(4);
-    expect(SWEEP_BUDGET_MS).toBeGreaterThanOrEqual(15_000);
-    expect(SWEEP_BUDGET_MS).toBeLessThanOrEqual(30_000);
+describe("F5 sweep defaults (behavioral bands)", () => {
+  it("production-shaped pool drains fully with zero deferral", async () => {
+    // Production sweep runs a width-3 pool over a 20s budget; fast items must
+    // all complete with nothing deferred. The true defaults are pinned
+    // end-to-end below (reentrancy raises BG_SWEEP_BUDGET_MS and sees no
+    // expiry; budget-expiry keeps the default and sees the deferral log).
+    const res = await runBoundedPool(["a", "b", "c", "d", "e", "f"], 3, 20_000, async () => {
+      await delay(5);
+    });
+    expect(res).toEqual({ completed: 6, skipped: 0 });
+  });
+
+  it("an already-exhausted budget defers everything without running one item", async () => {
+    // Budget is checked BETWEEN jobs only: with a zero budget no worker ever
+    // starts, so nothing runs and everything defers. Fully deterministic —
+    // no timing dependence (complements the 30ms/80ms expiry unit above).
+    let calls = 0;
+    const res = await runBoundedPool(["a", "b"], 3, 0, async () => {
+      calls++;
+    });
+    expect(calls).toBe(0);
+    expect(res).toEqual({ completed: 0, skipped: 2 });
   });
 });
 
