@@ -93,8 +93,12 @@ function toModelRef(model?: string): { providerID: string; modelID: string } | u
   if (model === undefined || slash <= 0) return undefined;
   return { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
 }
-function projectId(cwd: string): string { return createHash("sha1").update(cwd).digest("hex").slice(0, 12); }
-function baseDir(cwd: string): string {
+// Boot-crash guard: the host may invoke the factory with directory===undefined
+// (loader incident: previously threw bare TypeError from
+// createHash.update(undefined) and killed the boot). projectId/baseDir degrade
+// to homedir() instead of throwing — never bare TypeError, never dead boot.
+function projectId(cwd: string | undefined): string { return createHash("sha1").update(cwd ?? homedir()).digest("hex").slice(0, 12); }
+function baseDir(cwd: string | undefined): string {
   const dir = join(homedir(), ".local", "share", "opencode", "background-ops", projectId(cwd));
   mkdirSync(dir, { recursive: true, mode: 0o700 }); // L3: job output may hold secrets — never umask-inherited world-readable
   return dir;
@@ -509,7 +513,10 @@ function allKnownJobsFresh(cwd: string): Job[] {
 let reaperTimerArmed = false;
 export const BackgroundOps: Plugin = async ({ client, directory }) => {
   const c: any = client;
-  hardenPerms(baseDir(directory)); // L3: fix modes on pre-patch files, best-effort
+  // Boot-crash guard (see projectId/baseDir): normalize once at factory entry
+  // so every closure below degrades to homedir() instead of dying on undefined.
+  const safeDirectory: string = directory ?? homedir();
+  hardenPerms(baseDir(safeDirectory)); // L3: fix modes on pre-patch files, best-effort
   async function startTask(job: Job) {
     const MAX_TRIES = 3;
     const RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -545,7 +552,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     await notifyJob(c, job, { wake: true });
   }
   function startBash(job: Job) {
-    const child = spawn(job.prompt, { shell: "/bin/bash", cwd: job._cwd || directory, detached: false });
+    const child = spawn(job.prompt, { shell: "/bin/bash", cwd: job._cwd || safeDirectory, detached: false });
     job.pid = child.pid; procs.set(job.id, child); saveJob(job);
     writeHeartbeat(job, `bash spawned (pid=${child.pid})`);
     const chunks: string[] = [`$ ${job.prompt}\n`];
@@ -687,7 +694,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       // F4: capped append — the log keeps the most recent MAX_LOG_LINES
       // (heartbeat pattern); always-on durability unchanged.
       try {
-        const base = baseDir(live._cwd ?? directory);
+        const base = baseDir(live._cwd ?? safeDirectory);
         appendLogLine(join(base, ".notifications.log"), JSON.stringify({ ts: new Date().toISOString(), id: live.id, kind: live.kind, state: live.state, event, cleanEvt, elapsedS, summary: live.summary.slice(0, 120), rootSessionID: live.rootSessionID }) + "\n");
       } catch { /* never break the host */ }
       // (ii) R3 stderr block DELETED in r5-silent, KEPT deleted in r6/r7 (zero-red):
@@ -958,7 +965,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     // F5: overlapping ticks return immediately with a best-effort log line —
     // never run concurrently, never queue. The in-flight sweep owns the tick.
     if (sweepInFlight) {
-      try { appendLogLine(join(baseDir(directory), "last-idle.log"), `${new Date().toISOString()} | sweep skipped (already in flight)\n`); } catch { /* best-effort */ }
+      try { appendLogLine(join(baseDir(safeDirectory), "last-idle.log"), `${new Date().toISOString()} | sweep skipped (already in flight)\n`); } catch { /* best-effort */ }
       return;
     }
     sweepInFlight = true;
@@ -966,7 +973,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       // F4: retention rides the 60s sweep cadence (best-effort) so expired
       // terminal triples + oversized logs are reclaimed even when nobody lists.
       // Per-cwd stragglers are covered by the list/status miss-path prune.
-      try { pruneOldJobs(directory); } catch { /* best-effort */ }
+      try { pruneOldJobs(safeDirectory); } catch { /* best-effort */ }
       // F5: bounded pool — at most SWEEP_MAX_CONCURRENCY sweep bodies at once;
       // when the per-tick budget (CONFIG.sweepBudgetMs, default
       // SWEEP_BUDGET_MS, override BG_SWEEP_BUDGET_MS) expires the rest are
@@ -974,7 +981,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       // reaped for it).
       const { skipped } = await runBoundedPool([...jobs.values()], SWEEP_MAX_CONCURRENCY, CONFIG.sweepBudgetMs, (job) => sweepOneJob(job));
       if (skipped > 0) {
-        try { appendLogLine(join(baseDir(directory), "last-idle.log"), `${new Date().toISOString()} | sweep budget exhausted, ${skipped} deferred to next tick\n`); } catch { /* best-effort */ }
+        try { appendLogLine(join(baseDir(safeDirectory), "last-idle.log"), `${new Date().toISOString()} | sweep budget exhausted, ${skipped} deferred to next tick\n`); } catch { /* best-effort */ }
       }
     } catch (e: any) {
       console.error(`[background-ops] idle-reaper: sweep error: ${String(e?.message ?? e).slice(0, 200)}`);
@@ -1028,7 +1035,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       let timeout = args.timeout_minutes ?? DEFAULT_TIMEOUT_MINUTES;
       if (timeout <= 0 || timeout > CONFIG.maxTimeoutMinutes) timeout = CONFIG.maxTimeoutMinutes;
       if (kind === "bash") validateBashCommand(args.prompt);
-      const cwd = ctx.directory || directory, id = genId(), dir = baseDir(cwd);
+      const cwd = ctx.directory || safeDirectory, id = genId(), dir = baseDir(cwd);
       const now = Date.now();
       const makeJob = (state: State, summary: string): Job => ({
         id, kind, state, prompt: args.prompt, agent: (args as any).agent, model: (args as any).model, rootSessionID: ctx.sessionID, ownerSessionID: ctx.sessionID,
@@ -1057,7 +1064,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       // surface as completed/failed without waiting for a sweep. F2/A3 bounded
       // parallel refresh (concurrent + per-job timeout + fresh-heartbeat skip).
       await refreshRunningForRender();
-      const all = allKnownJobsFresh(ctx.directory || directory);
+      const all = allKnownJobsFresh(ctx.directory || safeDirectory);
       // R1 fence: list/status/running-read summaries are untrusted child output —
       // single-line + frame as untrusted (M1 cleanSingleLine pattern). NOTE: the
       // L1-accepted global list stays AS-IS by design (cross-session reads are
@@ -1072,7 +1079,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       // v2.2.0: same pre-render refresh as background_list. F2/A3 bounded
       // parallel refresh (concurrent + per-job timeout + fresh-heartbeat skip).
       await refreshRunningForRender();
-      const all = allKnownJobsFresh(ctx.directory || directory);
+      const all = allKnownJobsFresh(ctx.directory || safeDirectory);
       const list = args.id ? all.filter((j) => j.id === args.id) : all.filter((j) => j.state === "running" || j.state === "queued");
       if (!list.length) return args.id ? `No job ${args.id}` : "No running jobs.";
       const out: string[] = [`Concurrency: ${runningCount()}/${CONFIG.maxConcurrentJobs} running, ${queue.length} queued`];
@@ -1087,7 +1094,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     description: "Retrieve full persisted result of a background job. Returns immediately — [running] while active (core background_read blocks for the actual wait).",
     args: { id: tool.schema.string().describe("Job id") },
     async execute(args, ctx) {
-      const job = jobs.get(args.id) ?? loadJob(join(baseDir(ctx.directory || directory), `${args.id}.json`));
+      const job = jobs.get(args.id) ?? loadJob(join(baseDir(ctx.directory || safeDirectory), `${args.id}.json`));
       if (!job) return `No job ${args.id}. Use background_list to see all.`;
       if (!isOwner(job, ctx.sessionID)) return `No job ${args.id}. Use background_list to see all.`; // L1: fail-closed not-found
       jobs.set(job.id, job);
@@ -1104,7 +1111,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     description: "Inject follow-up instruction into a running background task (deadline NOT extended)",
     args: { id: tool.schema.string().describe("Job id"), instruction: tool.schema.string().describe("Follow-up instruction") },
     async execute(args, ctx) {
-      const job = jobs.get(args.id) ?? loadJob(join(baseDir(ctx.directory || directory), `${args.id}.json`));
+      const job = jobs.get(args.id) ?? loadJob(join(baseDir(ctx.directory || safeDirectory), `${args.id}.json`));
       if (!job) return `No job ${args.id}`;
       if (!isOwner(job, ctx.sessionID)) return `No job ${args.id}`; // L1: fail-closed not-found
       if (job.state !== "running" || job.kind === "bash" || !job.childSessionID) return `Cannot steer ${args.id}: state=${job.state} kind=${job.kind} child=${job.childSessionID ?? "none"}.`;
@@ -1121,7 +1128,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
     description: "Abort a running background job. Partial output is preserved.",
     args: { id: tool.schema.string().describe("Job id") },
     async execute(args, ctx) {
-      const job = jobs.get(args.id) ?? loadJob(join(baseDir(ctx.directory || directory), `${args.id}.json`));
+      const job = jobs.get(args.id) ?? loadJob(join(baseDir(ctx.directory || safeDirectory), `${args.id}.json`));
       if (!job) return `No job ${args.id}`;
       if (!isOwner(job, ctx.sessionID)) return `No job ${args.id}`; // L1: fail-closed not-found
       if (job.state === "queued") {
@@ -1168,7 +1175,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
         const sid = event?.type === "session.idle" ? event?.properties?.sessionID : null;
         if (!sid || !childSessions.has(sid)) return;
         // F4: capped append (heartbeat pattern) — most-recent MAX_LOG_LINES kept.
-        appendLogLine(join(baseDir(directory), "last-idle.log"), `${new Date().toISOString()} | child idle ${sid}\n`);
+        appendLogLine(join(baseDir(safeDirectory), "last-idle.log"), `${new Date().toISOString()} | child idle ${sid}\n`);
         // v2.2.0: child went idle → refresh matching running jobs (finalize
         // genuinely-done children) then uniform-notify (v1.2.0 L909-913
         // pattern, routed through notifyJob). Best-effort per job.
