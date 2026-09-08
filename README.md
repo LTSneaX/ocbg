@@ -178,6 +178,13 @@ rm ~/.config/opencode/plugins/background.ts  # then restart; verify the tools ar
 
 To restore: copy a `backups/` copy (or any repo version) back over `plugins/background.ts` and restart. The repo history holds every version — the repo is the authority, the disk file is just a copy.
 
+## Development
+
+Structural test-before-landing enforcement: no red suite lands on `main`.
+
+- **Pre-push hook.** Install once after cloning: `sh scripts/install-hooks.sh`. Every `git push` then runs `npm run typecheck` + `npm test` first — a red suite exits non-zero and blocks the push. Source of truth is `scripts/pre-push.sh`; never edit `.git/hooks/pre-push` in place, re-run the installer instead.
+- **CI.** `.github/workflows/ci.yml` runs the same gate (`npm ci`, `npx tsc --noEmit`, `npm test`) on every push and pull request. A red run blocks the merge.
+
 ## Docs
 
 - `docs/api.md` — full tool parameter reference
