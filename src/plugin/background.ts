@@ -49,6 +49,19 @@ const CONFIG = {
   // Validated parse: only exact "true" enables (unset defaults to ON).
   wakeNote: (process.env.BG_WAKE_NOTE ?? "true") === "true",
 };
+// BG_DEBUG env-gated boot diagnostics (default OFF): when BG_DEBUG=1 the boot
+// path emits console.error diagnostics verbose enough to diagnose console-only
+// boot crashes (factory entry input shape, safeDirectory guard decision,
+// hook wiring, reaper arm/skip). Default OFF preserves the zero-red doctrine —
+// dbg() is a strict no-op unless process.env.BG_DEBUG === "1", so normal boot
+// emits zero console output. Read live per call (not cached) so tests can
+// toggle without re-import. Never throws.
+function bgDebugEnabled(): boolean {
+  try { return process.env.BG_DEBUG === "1"; } catch { return false; }
+}
+function dbg(...args: unknown[]): void {
+  try { if (bgDebugEnabled()) console.error("[background-ops:debug]", ...args); } catch { /* diagnostics must never break the host */ }
+}
 type Kind = "task" | "bash"; type State = "running" | "completed" | "failed" | "stopped" | "queued";
 // L1: ownerSessionID is the session that created the job (== rootSessionID at
 // creation). read/steer/stop enforce caller === owner (fail-closed not-found).
@@ -163,16 +176,24 @@ function unrefTimer(t: ReturnType<typeof setTimeout>): void {
   } catch { /* best-effort: never break the caller */ }
 }
 export function createTrailingDebouncer(waitMs: number, fn: () => void): TrailingDebouncer {
+  // Totality: loader-style invocation (undefined/{}/boot-like object) must
+  // never throw and never arm a crashing timer (a garbage fn used to throw
+  // `fn is not a function` inside the setTimeout callback — an uncaught
+  // process crash). Garbage wait → 0 (still trailing-edge, fires next tick);
+  // non-function fn → noop. Well-formed inputs are byte-identical below.
+  const nWait = Number(waitMs);
+  const safeWait = Number.isFinite(nWait) && nWait > 0 ? nWait : 0;
+  const safeFn: () => void = typeof fn === "function" ? fn : () => {};
   let timer: ReturnType<typeof setTimeout> | null = null;
   const schedule = (): void => {
     if (timer !== null) return; // a pending trailing write already covers this push
-    timer = setTimeout(() => { timer = null; fn(); }, waitMs);
+    timer = setTimeout(() => { timer = null; safeFn(); }, safeWait);
     if (timer !== null) unrefTimer(timer); // never hold the host process open
   };
   const cancel = (): void => {
     if (timer !== null) { clearTimeout(timer); timer = null; }
   };
-  const flush = (): void => { cancel(); fn(); };
+  const flush = (): void => { cancel(); safeFn(); };
   return { schedule, cancel, flush };
 }
 // F2/A3 bounds for the list/status pre-render refresh: skip re-polling a task
@@ -309,26 +330,37 @@ function taskRefreshSkippable(job: Job): boolean {
 // ---------------------------------------------------------------------------
 export interface BoundedPoolResult { completed: number; skipped: number; }
 export async function runBoundedPool<T>(items: T[], limit: number, budgetMs: number, fn: (item: T) => Promise<void>): Promise<BoundedPoolResult> {
-  const pending = [...items];
-  const workers = Math.max(1, Math.floor(limit));
-  const startedAt = Date.now();
-  let completed = 0;
-  let budgetExhausted = false;
-  async function worker(): Promise<void> {
-    while (pending.length > 0) {
-      // Budget is checked BETWEEN jobs only: a started job always runs to its
-      // own skip/reap decision; expiry only defers not-yet-started jobs.
-      if (budgetExhausted || Date.now() - startedAt >= budgetMs) { budgetExhausted = true; return; }
-      const item = pending.shift()!;
-      try {
-        await fn(item);
-      } catch { /* per-item best-effort: one bad item never stops the pool */ }
-      completed++;
+  try {
+    // Totality: loader-style invocation (e.g. runBoundedPool({client…}) with a
+    // non-iterable first arg, or garbage limit/budget/fn) resolves to a no-op
+    // instead of throwing `items is not iterable` and killing the boot.
+    // Well-formed inputs take the identical pool path below (same values).
+    const list: T[] = Array.isArray(items) ? items : [];
+    const nLimit = Number(limit);
+    const nBudget = Number(budgetMs);
+    const safeFn: (item: T) => Promise<void> = typeof fn === "function" ? fn as (item: T) => Promise<void> : async () => {};
+    const safeBudget = Number.isFinite(nBudget) && nBudget > 0 ? nBudget : 0;
+    const pending = [...list];
+    const workers = Number.isFinite(nLimit) && nLimit > 0 ? Math.max(1, Math.floor(nLimit)) : 1;
+    const startedAt = Date.now();
+    let completed = 0;
+    let budgetExhausted = false;
+    async function worker(): Promise<void> {
+      while (pending.length > 0) {
+        // Budget is checked BETWEEN jobs only: a started job always runs to its
+        // own skip/reap decision; expiry only defers not-yet-started jobs.
+        if (budgetExhausted || Date.now() - startedAt >= safeBudget) { budgetExhausted = true; return; }
+        const item = pending.shift()!;
+        try {
+          await safeFn(item);
+        } catch { /* per-item best-effort: one bad item never stops the pool */ }
+        completed++;
+      }
     }
-  }
-  const n = Math.min(workers, pending.length);
-  await Promise.allSettled(Array.from({ length: n }, () => worker()));
-  return { completed, skipped: pending.length };
+    const n = Math.min(workers, pending.length);
+    await Promise.allSettled(Array.from({ length: n }, () => worker()));
+    return { completed, skipped: pending.length };
+  } catch { return { completed: 0, skipped: 0 }; }
 }
 // Bash activity signal: .md output-file mtime. Returns true ONLY when the output
 // provably shows no writes within idleCloseMs. Fresh mtime, clock skew (negative
@@ -439,6 +471,12 @@ function appendLogLine(path: string, line: string): void {
 // throws; returns pruned ids for observability/tests.
 export function pruneOldJobs(cwd: string, now: number = Date.now()): string[] {
   const pruned: string[] = [];
+  // Totality: loader-style invocation with a non-string cwd ({}/undefined/
+  // boot-like object) returns the safe no-op instead of hashing garbage into
+  // createHash (throw) or touching homedir disk as a side effect. Well-formed
+  // callers always pass a string (factory safeDirectory, tests), so behavior
+  // for them is unchanged.
+  if (typeof cwd !== "string") return pruned;
   try {
     const dir = baseDir(cwd);
     const cutoff = now - CONFIG.retentionDays * 86400_000;
@@ -511,12 +549,28 @@ function allKnownJobsFresh(cwd: string): Job[] {
 // imports (the normal boot path, including every test boot via resetModules)
 // arm exactly one timer each, so per-instance behavior is unchanged.
 let reaperTimerArmed = false;
-export const BackgroundOps: Plugin = async ({ client, directory }) => {
-  const c: any = client;
+export const BackgroundOps: Plugin = async (input: any = {}) => {
+  // Totality: the loader may invoke the factory with undefined/{}/boot-like
+  // shapes. Default + optional-chaining normalize every shape to
+  // (client=undefined, directory=homedir-fallback) instead of throwing on
+  // destructure — a throw here kills the whole boot (cf. 5bf948f guard).
+  const c: any = input?.client;
+  const directory: string | undefined = input?.directory;
+  // BG_DEBUG=1 diagnostics (default OFF, zero-red otherwise): input shape,
+  // client presence, and directory type — enough to triage a console-only
+  // boot crash from the log alone. All inspection is best-effort.
+  try {
+    const shape = input === undefined ? "undefined" : input === null ? "null" : `${typeof input} keys=[${Object.keys(input ?? {}).join(",")}]`;
+    const clientShape = c === undefined ? "undefined" : c === null ? "null" : `${typeof c} keys=[${(c !== null && (typeof c === "object" || typeof c === "function")) ? Object.keys(c).join(",") : ""}]`;
+    dbg("factory entry", `input=${shape}`, `client=${clientShape}`, `directoryType=${typeof directory}`, `directory=${typeof directory === "string" ? directory : String(directory)}`);
+  } catch { /* diagnostics must never break the host */ }
   // Boot-crash guard (see projectId/baseDir): normalize once at factory entry
   // so every closure below degrades to homedir() instead of dying on undefined.
   const safeDirectory: string = directory ?? homedir();
-  hardenPerms(baseDir(safeDirectory)); // L3: fix modes on pre-patch files, best-effort
+  dbg("guard decision", typeof directory === "string" ? `directory as-is: ${directory}` : `directory fallback → homedir(): ${safeDirectory} (was ${String(directory)})`);
+  const projectBase = baseDir(safeDirectory);
+  hardenPerms(projectBase); // L3: fix modes on pre-patch files, best-effort
+  dbg("hook wiring", `baseDir ready: ${projectBase}`, `reaperArmedAlready=${reaperTimerArmed}`);
   async function startTask(job: Job) {
     const MAX_TRIES = 3;
     const RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -993,11 +1047,13 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
   // timer lives for the host process lifetime; unref() guarantees it never
   // holds the process open on its own. F6.5: armed once per module instance —
   // a second factory invocation reuses the running sweep instead of doubling it.
+  const reaperAlreadyArmed = reaperTimerArmed;
   if (!reaperTimerArmed) {
     reaperTimerArmed = true;
     const idleReaperTimer = setInterval(() => { sweepIdleJobs().catch(() => { /* per-job logging already handled */ }); }, IDLE_SWEEP_INTERVAL_MS);
     (idleReaperTimer as any)?.unref?.();
   }
+  dbg("reaper", reaperAlreadyArmed ? "reused running sweep (hot-reload, no double arm)" : `armed ${IDLE_SWEEP_INTERVAL_MS}ms idle sweep (unref'd)`);
   // F2/A3: bounded parallel pre-render refresh shared by background_list and
   // background_status. Replaces the old serial per-job await loop: every
   // running job refreshes CONCURRENTLY via Promise.allSettled (latency drops
@@ -1165,6 +1221,7 @@ export const BackgroundOps: Plugin = async ({ client, directory }) => {
       ].join("\n");
     },
   });
+  dbg("factory wired", "tools=[background_run,background_list,background_status,background_read,background_steer,background_stop,background_config] + tool.execute.before + event(session.idle) + experimental.chat.system.transform + experimental.session.compacting");
   return {
     tool: { background_run, background_list, background_status, background_read, background_steer, background_stop, background_config },
     "tool.execute.before": async (input) => {

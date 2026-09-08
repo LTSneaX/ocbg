@@ -16,6 +16,7 @@ import { vi } from "vitest";
 const BG_SPEC = "../src/plugin/background.ts";
 
 export const BG_KEYS = [
+  "BG_DEBUG",
   "BG_WAKE_NOTE",
   "BG_NOTIFY_DEFAULT",
   "BG_MAX_TIMEOUT_MINUTES",
