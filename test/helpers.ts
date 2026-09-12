@@ -27,6 +27,7 @@ export const BG_KEYS = [
   "BG_RETENTION_DAYS",
   "BG_SWEEP_BUDGET_MS",
   "BG_JOB_ID_TYPE",
+  "BG_U2_TIMEOUT_MS",
 ];
 
 let savedEnv: Record<string, string | undefined> = {};

@@ -603,3 +603,85 @@ New-code branches ALL covered except 6 defensive fallbacks, waived here
   test/u1-enrichment.test.ts (NEW, 18 its) + docs/coverage-ratchet.md (this U1
   section), ALL uncommitted. No live writes, no repo logs/ (logs in
   /tmp/ocbg-logs/).
+
+---
+
+## U2 — Production deltas (src/plugin/background.ts, pending-notification fallback)
+
+U2 (competitive-sweep upgrade U2, kdco queuePending + inject-on-next-chat.message
+analogue): the turn-firing reply-mode wake stays FIRST and default — U2 only
+catches the drop. notifyJob enqueues the wake text BEFORE the attempt
+(bounded U2_MAX_PENDING=20, oldest dropped / freshest kept) and dequeues on
+proven delivery; a throw or timeout leaves the item queued, and the next
+"chat.message" hook entry prepends the drained items into that turn's message
+parts (parent sees them as part of a turn and acts — turn-firing preserved,
+busy-parent drop fixed). The drain is a single CAS splice (success-path hook
+entries are no-ops, concurrent entries cannot double-deliver). No injectable
+parts surface → bounded re-queue for the following turn (nothing lost). The
+wake attempt races BG_U2_TIMEOUT_MS (default U2_WAKE_TIMEOUT_MS=30_000, same
+parsePositiveMs discipline as U1) — mirrors the U1 30s-race, so a hung parent
+can no longer wedge the awaited terminal path either (at-least-once
+semantics: a race-loser late success plus a queued item may deliver twice;
+notification text is idempotent, parent dedupes).
+
+- U2-D-01 module constants (:~106-108): U2_WAKE_TIMEOUT_MS + U2_MAX_PENDING +
+  PendingWake interface. Type-only, zero exports (manifest unchanged).
+- U2-D-02 queue closures (:~955-975): queuePendingWake / removePendingWake /
+  drainPendingWake. Module-private, total (comment-only catches), no exports.
+- U2-D-03 wake block (:~1069-1075): enqueue → withTimeout-raced promptAsync →
+  dequeue-on-success / catch-keeps-queued. Replaces the old
+  `?.catch(() => null)` swallow (rejections now route to the queue; terminal
+  DONE/toast/logs behavior byte-identical, S5 throw/reject/missing-surface
+  tests still green unmodified).
+- U2-D-04 "chat.message" hook (:~1562+): drain → early-return when empty →
+  combined block prepend into output.message.parts ?? output.parts → re-queue
+  when no surface. Extra hook key only (host ignores unknown keys; loader
+  manifest untouched — probe-3 still exact).
+- v8-ignore +0 lines / +0 regions (no new defensive dead code: every new line
+  executes).
+
+## U2 — New tests (test/u2-pending.test.ts, 7 its)
+
+Throw-queues + hook-prepends-once (second entry no-op, DONE marker intact);
+80ms-timeout-queues + fast terminal + prepend-before-user-text;
+success-dequeues (hook no-op, no double-fire); output.parts fallback road;
+no-surface re-queue then next-turn delivery; 21-failures cap (freshest 20
+kept, oldest dropped, `pending notifications (20)`); hook loader-shape smoke
+(empty/undefined carriers never throw). helpers.ts BG_KEYS gains
+BG_U2_TIMEOUT_MS (env-hygiene, additive only).
+
+## U2 — Branch/waiver accounting (BRDA taken=0 from coverage/lcov.info)
+
+New-code branches ALL covered except 1 defensive fallback, waived here:
+
+- U2-W-05 :965 `if (i >= 0)` false-arm (removePendingWake not-found) — WAIVER:
+  enqueue-before-attempt invariant means the id is always present when
+  removal runs; the arm is unreachable via the public surface (same class as
+  standing S4b waivers). Single-line if → lines 100% unaffected.
+- Covered (no waiver): cap-full/drop-oldest arm (21-failure test), drain
+  empty/non-empty arms, wake success/throw/timeout arms, hook empty-return,
+  message.parts / output.parts / no-surface-requeue arms, `??` both sides.
+
+## U2 — Ticket impact
+
+- S4-COV-06/07/08/10(residual)/11/13/14 remain OPEN, untouched by U2 (no
+  production lines in their areas changed).
+- S4-COV-15 stays CLOSED. No new tickets. Waivers +1 (U2-W-05); standing
+  waivers (S4b-NEW-01/02/03, B-001–B-007, B-018/019, B-021, B-030, B-035,
+  B-042–B-048, B-064/065, B-068/069, B-090/091/097/098, B-103/104/105,
+  U1-W-01..04, F-002, F-012) carried forward unchanged.
+
+## U2 re-proof (post-docs check-list for the pre-commit gate)
+
+- `npm test` → 261/261 green (22 files: 254 S0-U1 + 7 U2).
+- `npx vitest run --coverage` → Lines 100% (715/715); Branch 91.51%
+  (658/719, +11 taken vs U1; 1 new untaken = U2-W-05 above); Funcs 98.51%
+  (133/135, +6 new all covered, uncovered = standing F-002/F-012 only).
+- `tsc --noEmit` → exit 0. `scripts/loader-guard.sh` → green (probe-3
+  manifest-acceptance exact: BackgroundOps+default + 5 helpers, 7 tools).
+  `node --check` → all 25 dist .js OK. `test/boot-contract.test.ts` solo → 5/5.
+- Change set: src/plugin/background.ts (U2 constants + queue closures + wake
+  block + chat.message hook) + test/u2-pending.test.ts (NEW, 7 its) +
+  test/helpers.ts (BG_KEYS +1 env-hygiene) + docs/coverage-ratchet.md (this U2
+  section), ALL uncommitted. No live writes, no repo logs/ (logs in
+  /tmp/ocbg-logs/).
