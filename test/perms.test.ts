@@ -2,7 +2,7 @@
 // and repairs pre-patch world-readable modes. All on isolated tmp HOME.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { statSync, chmodSync, writeFileSync, mkdirSync } from "fs";
+import { statSync, chmodSync, writeFileSync, mkdirSync, unlinkSync, existsSync } from "fs";
 import { join } from "path";
 import {
   saveEnv,
@@ -50,22 +50,35 @@ describe("G6 permissions", () => {
     await plugin.tool.background_stop.execute({ id: taskId }, owner); // cleanup
   });
 
-  it("hardenPerms repairs pre-patch world-readable modes on next boot", async () => {
+  it("hardenPerms repairs pre-patch world-readable modes on next boot (deferred, S2)", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient() });
     const owner = makeCtx(OWNER, dir);
     const id = runId(await plugin.tool.background_run.execute({ kind: "bash", prompt: "echo x" }, owner));
     await waitTerminal(plugin, owner, id);
     const base = projectDir(home, dir);
-    // simulate pre-patch umask-inherited files
+    // simulate pre-patch umask-inherited files: world-readable modes + NO
+    // .perms-hardened marker (pre-patch installs never wrote one, so the
+    // deferred S2 pass must not skip this dir as already-hardened).
     chmodSync(join(base, `${id}.json`), 0o644);
     chmodSync(join(base, `${id}.md`), 0o644);
     expect(mode(join(base, `${id}.json`))).toBe(0o644);
-    // next boot hardens in place
+    try { unlinkSync(join(base, ".perms-hardened")); } catch { /* marker may not exist yet */ }
+    // next boot schedules the repair OFF the boot thread (S2/P1): boot must
+    // resolve first, then the deferred pass repairs. Poll for the repair.
     await boot({ dir, client: makeClient() });
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      try {
+        if (mode(join(base, `${id}.json`)) === 0o600 && mode(join(base, `${id}.md`)) === 0o600) break;
+      } catch { /* dir may be mid-repair */ }
+      await new Promise((r) => setTimeout(r, 50));
+    }
     expect(mode(base)).toBe(0o700);
     expect(mode(join(base, `${id}.json`))).toBe(0o600);
     expect(mode(join(base, `${id}.md`))).toBe(0o600);
+    // once-per-install marker was written by the deferred pass
+    expect(existsSync(join(base, ".perms-hardened"))).toBe(true);
   });
 
   it("hardenPerms never throws on unreadable dirs (failure injection)", async () => {

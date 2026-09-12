@@ -66,3 +66,34 @@ import("./dist/src/plugin/background.js").then(async (m) => {
 }).catch((e) => { console.error("INVOKE-GUARD import failed: " + ((e && e.message) || e)); process.exit(1); });
 '
 echo "[loader-guard] invoke-robustness green"
+
+echo "[loader-guard] probing manifest-acceptance (exactly BackgroundOps+default plugin entries + helper allowlist)..."
+node --input-type=module -e '
+import("./dist/src/plugin/background.js").then(async (m) => {
+  const plugin = ["BackgroundOps", "default"];
+  const helpers = ["__clearListCache", "__getDiskScanCount", "createTrailingDebouncer", "pruneOldJobs", "runBoundedPool"];
+  const allow = [...plugin, ...helpers].sort();
+  const keys = Object.keys(m).sort();
+  const same = keys.length === allow.length && keys.every((k, i) => k === allow[i]);
+  if (!same) { console.error("MANIFEST-MISMATCH got=[" + keys.join(",") + "] want=[" + allow.join(",") + "]"); process.exit(1); }
+  for (const k of plugin) {
+    if (typeof m[k] !== "function") { console.error("MANIFEST-TRIPWIRE plugin entry " + k + " is " + typeof m[k]); process.exit(1); }
+  }
+  for (const k of helpers) {
+    if (typeof m[k] !== "function") { console.error("MANIFEST-TRIPWIRE helper " + k + " is " + typeof m[k]); process.exit(1); }
+  }
+  if (m.default !== m.BackgroundOps) { console.error("MANIFEST-MISMATCH default is not the BackgroundOps factory (1+default identity)"); process.exit(1); }
+  // Loader-shape factory resolve on both entries: each must yield the 7-tool surface.
+  const SEVEN = ["background_run", "background_list", "background_status", "background_read", "background_steer", "background_stop", "background_config"];
+  for (const entry of plugin) {
+    let p;
+    try { p = await m[entry]({}); } catch (e) { console.error("MANIFEST-THROW " + entry + " on {}: " + ((e && e.message) || e)); process.exit(1); }
+    for (const t of SEVEN) {
+      if (typeof p?.tool?.[t]?.execute !== "function") { console.error("MANIFEST-MISSING " + entry + " lacks tool " + t); process.exit(1); }
+    }
+  }
+  console.log("MANIFEST-GUARD green: plugin entries {BackgroundOps,default} (1+default identity) + " + helpers.length + " helpers, 7 tools on both");
+  process.exit(0);
+}).catch((e) => { console.error("MANIFEST-GUARD import failed: " + ((e && e.message) || e)); process.exit(1); });
+'
+echo "[loader-guard] manifest-acceptance green"

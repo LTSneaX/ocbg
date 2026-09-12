@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, execFileSync, type ChildProcess } from "child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, appendFileSync, chmodSync, unlinkSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -110,24 +110,106 @@ function toModelRef(model?: string): { providerID: string; modelID: string } | u
 // (loader incident: previously threw bare TypeError from
 // createHash.update(undefined) and killed the boot). projectId/baseDir degrade
 // to homedir() instead of throwing — never bare TypeError, never dead boot.
-function projectId(cwd: string | undefined): string { return createHash("sha1").update(cwd ?? homedir()).digest("hex").slice(0, 12); }
-function baseDir(cwd: string | undefined): string {
-  const dir = join(homedir(), ".local", "share", "opencode", "background-ops", projectId(cwd));
-  mkdirSync(dir, { recursive: true, mode: 0o700 }); // L3: job output may hold secrets — never umask-inherited world-readable
-  return dir;
+// S2: projectId is git-aware — inside a git repo (incl. linked worktrees:
+// rev-parse --show-toplevel resolves the worktree root) the id derives from
+// sha1(gitRoot)[0:12] so all worktrees/dirs of one repo share one project dir;
+// outside git (or on timeout/error) it falls back to sha1(cwd)[0:12], which
+// keeps isolated tmp dirs (tests) on the exact pre-S2 paths. The git probe is
+// best-effort with a 5s cap and never throws. BG_PROJECT_ID pins the id source:
+// "git"/unset (default safe) = git-aware path above; any other non-empty value
+// = sha1(that value)[0:12] (deterministic pinned id). Never throws.
+function projectId(cwd: string | undefined): string {
+  try {
+    const dir = cwd ?? homedir();
+    const override = process.env.BG_PROJECT_ID;
+    if (override !== undefined && override !== "" && override !== "git" && override !== "auto") {
+      return createHash("sha1").update(override).digest("hex").slice(0, 12);
+    }
+    try {
+      const root = (execFileSync("git", ["rev-parse", "--show-toplevel"], {
+        cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8",
+      } as unknown as Record<string, unknown>) as unknown as string).trim();
+      if (root) return createHash("sha1").update(root).digest("hex").slice(0, 12);
+    } catch { /* non-git / timeout / missing git → cwd fallback below */ }
+    return createHash("sha1").update(dir).digest("hex").slice(0, 12);
+  } catch {
+    try { return createHash("sha1").update(homedir()).digest("hex").slice(0, 12); } catch { return "000000000000"; }
+  }
 }
-// L3: best-effort permission hardening on startup — existing dirs/files from
+function baseDir(cwd: string | undefined): string {
+  // S2: never throws — persistence must degrade, never kill the boot.
+  try {
+    const dir = join(homedir(), ".local", "share", "opencode", "background-ops", projectId(cwd));
+    try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { /* best-effort: use path as-is */ }
+    return dir;
+  } catch {
+    try {
+      const fb = join(homedir(), ".local", "share", "opencode", "background-ops", "000000000000");
+      try { mkdirSync(fb, { recursive: true, mode: 0o700 }); } catch { /* best-effort */ }
+      return fb;
+    } catch { return join("/tmp", "ocbg-fallback"); }
+  }
+}
+// S1: client-like positional shape — the loader may invoke the factory with
+// the client itself (positional) instead of {client, directory}. A client-like
+// value carries a .session object/function (create/promptAsync/messages/abort
+// live there). Module-private (NOT exported): the loader manifest stays exact.
+// Never throws.
+function isClientLike(v: unknown): boolean {
+  try {
+    const s = (v as any)?.session;
+    return s !== null && (typeof s === "object" || typeof s === "function");
+  } catch { return false; }
+}
+// L3: best-effort permission hardening — existing dirs/files from
 // pre-patch runs may carry umask-inherited modes. Never throws.
+// S2: capped at 200 entries per run (P1 stall fix — a huge history dir must
+// never wedge the harden pass) and idempotent-once-per-install via the
+// .perms-hardened marker (VERSION bytes): repeat boots with a current marker
+// skip the scan entirely (see scheduleDeferredHarden). The marker itself is
+// written 0o600 after the pass.
+const HARDEN_MAX_ENTRIES = 200;
+const PERMS_MARKER = ".perms-hardened";
 function hardenPerms(dir: string): void {
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     let entries: string[] = [];
     try { entries = readdirSync(dir); } catch { return; }
-    for (const f of entries) {
+    for (const f of entries.slice(0, HARDEN_MAX_ENTRIES)) {
       try { chmodSync(join(dir, f), 0o600); } catch { /* best-effort per file */ }
     }
     try { chmodSync(dir, 0o700); } catch { /* best-effort */ }
+    try { writeFileSync(join(dir, PERMS_MARKER), VERSION + "\n", { mode: 0o600 }); } catch { /* best-effort */ }
   } catch { /* never break the host */ }
+}
+// S2: hardenPerms runs DEFERRED OFF the boot thread (P1 stall fix). The factory
+// schedules one unref'd next-tick pass instead of blocking boot on a disk
+// scan: factory resolve + 7-tool serving never wait for harden, the timer
+// never holds the process open (unref), and a current .perms-hardened marker
+// skips the pass entirely. Never throws, never blocks.
+function scheduleDeferredHarden(dir: string): void {
+  try {
+    let current = false;
+    try {
+      current = existsSync(join(dir, PERMS_MARKER)) && readFileSync(join(dir, PERMS_MARKER), "utf8").trim() === VERSION;
+    } catch { current = false; }
+    if (current) { dbg("perms", `marker current (${PERMS_MARKER}=${VERSION}) — skipping deferred harden`); return; }
+    // Fast path: an empty project dir has nothing to harden — stamp the marker
+    // inline (one tiny write, no enumeration, no timer) so repeat boots skip
+    // without ever arming a timer. Non-empty dirs take the deferred pass below.
+    try {
+      if (readdirSync(dir).length === 0) {
+        try { writeFileSync(join(dir, PERMS_MARKER), VERSION + "\n", { mode: 0o600 }); } catch { /* best-effort */ }
+        dbg("perms", `empty dir, marker stamped inline (no timer): ${dir}`);
+        return;
+      }
+    } catch { /* fall through to the deferred pass */ }
+    const t = setTimeout(() => {
+      try { hardenPerms(dir); dbg("perms", `deferred harden pass done: ${dir}`); } catch { /* never break the host */ }
+    }, 0);
+    unrefTimer(t);
+    dbg("perms", `deferred harden scheduled: ${dir}`);
+  } catch { /* diagnostics/scheduling must never break the host */ }
 }
 const malformedWarned = new Set<string>();
 function warnMalformed(statePath: string, reason: string) {
@@ -155,11 +237,19 @@ function loadJob(statePath: string): Job | null {
   } catch { return null; }
 }
 function saveJob(job: Job) {
-  mkdirSync(join(job.outputPath, ".."), { recursive: true, mode: 0o700 }); // L3
-  writeFileSync(job.statePath, JSON.stringify(job, null, 2), { mode: 0o600 }); // L3
+  // S2: best-effort — a throwing persistence path inside a bash EventEmitter
+  // callback (I7 precedent) would surface as an uncaught exception and can
+  // crash the host. Durability on the happy path is unchanged.
+  try {
+    mkdirSync(join(job.outputPath, ".."), { recursive: true, mode: 0o700 }); // L3
+    writeFileSync(job.statePath, JSON.stringify(job, null, 2), { mode: 0o600 }); // L3
+  } catch { /* never break the host */ }
 }
 function persistOutput(job: Job, body: string) {
-  writeFileSync(job.outputPath, `# ${job.title}\n\n- id: ${job.id}\n- kind: ${job.kind}\n- state: ${job.state}\n- started: ${new Date(job.startedAt).toISOString()}\n${job.endedAt ? `- ended: ${new Date(job.endedAt).toISOString()}\n` : ""}- summary: ${job.summary}\n\n---\n\n${body}`, { mode: 0o600 }); // L3
+  // S2: best-effort, same I7 rationale as saveJob above.
+  try {
+    writeFileSync(job.outputPath, `# ${job.title}\n\n- id: ${job.id}\n- kind: ${job.kind}\n- state: ${job.state}\n- started: ${new Date(job.startedAt).toISOString()}\n${job.endedAt ? `- ended: ${new Date(job.endedAt).toISOString()}\n` : ""}- summary: ${job.summary}\n\n---\n\n${body}`, { mode: 0o600 }); // L3
+  } catch { /* never break the host */ }
 }
 // F1: trailing-edge debounce window for bash persistOutput (250-500ms per
 // review: 300ms). Chunks arrive per data event; without coalescing every chunk
@@ -551,10 +641,12 @@ function allKnownJobsFresh(cwd: string): Job[] {
 let reaperTimerArmed = false;
 export const BackgroundOps: Plugin = async (input: any = {}) => {
   // Totality: the loader may invoke the factory with undefined/{}/boot-like
-  // shapes. Default + optional-chaining normalize every shape to
-  // (client=undefined, directory=homedir-fallback) instead of throwing on
-  // destructure — a throw here kills the whole boot (cf. 5bf948f guard).
-  const c: any = input?.client;
+  // shapes — or with the client itself positionally. Default +
+  // optional-chaining normalize every shape to (client=undefined,
+  // directory=homedir-fallback) instead of throwing on destructure — a throw
+  // here kills the whole boot (cf. 5bf948f guard). S1: input?.client first
+  // (object form wins), client-like positional input second, else undefined.
+  const c: any = input?.client ?? (isClientLike(input) ? input : undefined);
   const directory: string | undefined = input?.directory;
   // BG_DEBUG=1 diagnostics (default OFF, zero-red otherwise): input shape,
   // client presence, and directory type — enough to triage a console-only
@@ -569,7 +661,11 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
   const safeDirectory: string = directory ?? homedir();
   dbg("guard decision", typeof directory === "string" ? `directory as-is: ${directory}` : `directory fallback → homedir(): ${safeDirectory} (was ${String(directory)})`);
   const projectBase = baseDir(safeDirectory);
-  hardenPerms(projectBase); // L3: fix modes on pre-patch files, best-effort
+  // S2: hardenPerms is DEFERRED OFF the boot thread (P1 stall fix) — the old
+  // synchronous hardenPerms(projectBase) call blocked factory resolve on a
+  // full disk scan. The deferred pass (unref'd, marker-gated) never blocks
+  // boot, never holds the process open, never throws.
+  scheduleDeferredHarden(projectBase); // L3: fix modes on pre-patch files, deferred + best-effort
   dbg("hook wiring", `baseDir ready: ${projectBase}`, `reaperArmedAlready=${reaperTimerArmed}`);
   async function startTask(job: Job) {
     const MAX_TRIES = 3;
