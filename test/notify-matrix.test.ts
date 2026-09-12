@@ -17,6 +17,7 @@ import {
   readNotifications,
   waitTerminal,
   wakeCalls,
+  waitFanin,
   completedMessages,
   type MockClient,
 } from "./helpers.js";
@@ -90,6 +91,7 @@ describe("G1 notify matrix", () => {
     await t.plugin.tool.background_list.execute({}, t.owner);
     const st = readState(home, t.dir, t.id);
     expect(st.state).toBe("completed");
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(t.client, OWNER)).toHaveLength(1);
     expect(t.client.tui.showToast).toHaveBeenCalledTimes(1);
     expect(t.client.app.log).toHaveBeenCalledTimes(1);
@@ -145,6 +147,7 @@ describe("G1 notify matrix", () => {
     await waitTerminal(t.plugin, t.owner, t.id);
     const st = readState(home, t.dir, t.id);
     expect(st.state).toBe("failed");
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(t.client, OWNER)).toHaveLength(1);
     expect(t.client.tui.showToast).toHaveBeenCalledTimes(1);
     const toastArg = t.client.tui.showToast.mock.calls[0][0];
@@ -200,6 +203,7 @@ describe("G1 notify matrix", () => {
     const t = await stoppedJob();
     const st = readState(home, t.dir, t.id);
     expect(st.state).toBe("stopped");
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(t.client, OWNER)).toHaveLength(1);
     expect(t.client.tui.showToast).toHaveBeenCalledTimes(1);
     expect(readNotifications(home, t.dir).find((n: any) => n.id === t.id)?.event).toBe("stopped");
@@ -252,6 +256,7 @@ describe("G1 notify matrix", () => {
     const st = readState(home, t.dir, t.id);
     expect(st.state).toBe("stopped");
     expect(st.timedOut).toBe(true);
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(t.client, OWNER)).toHaveLength(1);
     expect(readNotifications(home, t.dir).find((n: any) => n.id === t.id)?.event).toBe("timeout");
     const toastMsg: string = t.client.tui.showToast.mock.calls[0][0]?.body?.message ?? "";
@@ -307,6 +312,7 @@ describe("G1 notify matrix", () => {
     const t = await startTask({ messages: completedMessages("once only") });
     await t.plugin.tool.background_list.execute({}, t.owner);
     expect(readState(home, t.dir, t.id).state).toBe("completed");
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(t.client, OWNER)).toHaveLength(1);
     await t.plugin.tool.background_list.execute({}, t.owner);
     await t.plugin.tool.background_status.execute({}, t.owner);

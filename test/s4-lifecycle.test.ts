@@ -22,6 +22,7 @@ import {
   readState,
   projectDir,
   waitTerminal,
+  waitFanin,
   type MockClient,
 } from "./helpers.js";
 
@@ -669,6 +670,7 @@ describe("S4 dispatch combos + error funnel (S4-COV-07)", () => {
     const st = readState(home, dir, id);
     expect(st.state).toBe("failed");
     expect(st.summary).toContain("3 tries");
+    await waitFanin(); // U4: terminal wake is debounced (≤200ms), not instant
     // 3 dispatch tries + 1 terminal wake-note (same mock, parent road).
     const dispatchCalls = client.session.promptAsync.mock.calls.filter(
       (c: any) => c?.[0]?.path?.id !== OWNER,

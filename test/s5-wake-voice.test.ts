@@ -23,6 +23,7 @@ import {
   readOutput,
   readNotifications,
   wakeCalls,
+  waitFanin,
   completedMessages,
   projectDir,
 } from "./helpers.js";
@@ -61,6 +62,7 @@ describe("S5 wake-voice", () => {
     );
     await plugin.tool.background_list.execute({}, owner);
     expect(readState(home, dir, id).state).toBe("completed");
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     const calls = wakeCalls(client, OWNER);
     expect(calls).toHaveLength(1);
     const body = calls[0]?.[0]?.body ?? {};
@@ -107,6 +109,7 @@ describe("S5 wake-voice", () => {
     expect(st.state).toBe("completed");
     expect(st.notified).toBe(true);
     expect(st.summary.startsWith("[DONE COMPLETED]")).toBe(true);
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(client, OWNER)).toHaveLength(1); // attempted, swallowed
     expect(client.tui.showToast).toHaveBeenCalledTimes(1);
   });
@@ -143,6 +146,7 @@ describe("S5 wake-voice", () => {
     expect(st.state).toBe("completed");
     expect(st.notified).toBe(true);
     expect(st.summary.startsWith("[DONE COMPLETED]")).toBe(true);
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(client, OWNER)).toHaveLength(1);
   });
 
@@ -179,6 +183,7 @@ describe("S5 wake-voice", () => {
     expect(st.state).toBe("stopped");
     expect(st.notified).toBe(true);
     expect(st.summary.startsWith("[DONE STOPPED]")).toBe(true);
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(client, OWNER)).toHaveLength(1);
     expect(client.tui.showToast).toHaveBeenCalledTimes(1);
   });

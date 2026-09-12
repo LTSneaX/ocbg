@@ -17,6 +17,7 @@ import {
   readState,
   projectDir,
   waitTerminal,
+  waitFanin,
   completedMessages,
 } from "./helpers.js";
 
@@ -185,6 +186,7 @@ describe("surface", () => {
     const childId = readState(home, dir, id).childSessionID as string;
     await (plugin as any).event({ event: { type: "session.idle", properties: { sessionID: childId } } });
     expect(readState(home, dir, id).state).toBe("completed");
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     // refresh routes through completeJobInternal (wake:true funnel); the extra
     // idle-path notifyJob(wake:false) is then a notified-guard no-op => exactly 1 wake
     const wakeToParent = client.session.promptAsync.mock.calls.filter(

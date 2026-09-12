@@ -753,3 +753,102 @@ arms via the fallback + bash + task tests. Uncovered funcs stay exactly the
   4 fan-ins) + test/u3-blocking-read.test.ts (NEW, 8 its) +
   docs/coverage-ratchet.md (this U3 section), ALL uncommitted. No live
   writes, no repo logs/ (logs in /tmp/ocbg-logs/).
+
+---
+
+## U4 — All-complete debounced fan-in (per-parent token + 50-200ms timer + remainingCount)
+
+Delta: src/plugin/background.ts — module-private U4 block (:~109-134:
+U4_DEBOUNCE_DEFAULT/MIN/MAX consts, isU4FaninEnabled kill-switch read,
+parseU4DebounceMs single-expression clamp; all module-private, zero new
+exports) + factory closures scheduleU4Fanin / fireU4Fanin + U4FaninEntry /
+u4FaninByParent (:~1062-1110) + notifyJob wake-road branch (:~1182-1207:
+fan-in default ON with persisted-first saveJob-before-schedule, legacy
+immediate per-job road under BG_U4_FANIN=0, byte-identical to pre-U4).
+Default ON: N near-simultaneous terminals to one parent coalesce into ONE
+promptAsync wake (N-turn spam killed); kill-switch restores N wakes.
+
+- U4-D-01 cycle token: per-parent entry {token, pending}; every schedule
+  bumps the token and arms its own unref'd timer (old timers NOT cleared —
+  their token is stale so they return without sending; the quiet window
+  extends naturally and the stale arm stays publicly reachable, no waiver).
+- U4-D-02 fire triple-re-validates: (1) entry exists AND token current,
+  (2) pending drained in one CAS splice (no double-send), (3)
+  remainingCount (runningCount + queue.length) recomputed fresh at fire
+  time. Combined wake reuses the per-job noteText bytes verbatim (trusted
+  prefix + untrusted fence + read-hint per job survive the bundle — the S5
+  reply-mode contract holds for single-job bundles too), led by one
+  all-complete header (`N jobs finished, M remaining (R running + Q
+  queued)`).
+- U4-D-03 U2 fallback preserved: the bundle is enqueue-then-dequeue-on-
+  success under a `fanin:<parent>:<token>` key (+ defensive per-job removals
+  — the not-found arm is the standing U2-W-05 waiver); throw/timeout leaves
+  ONE bundle for the chat.message hook (no N-item queue spam either).
+- U4-D-04 persisted-first + single-writer: saveJob runs BEFORE the schedule
+  (DONE marker + .notifications.log + state durable while the wake is still
+  in flight); the notified/unread guards still gate scheduling (each job
+  schedules at most once). wake:false / wakeNote OFF / notify-off roads
+  never schedule. v8-ignore +0 lines / +0 regions (no defensive dead code:
+  every new line executes; empty catches are comment-only like the rest).
+- U4-D-05 existing-suite impact (waits only, zero assertion changes):
+  test/helpers.ts gains BG_U4_FANIN + BG_U4_DEBOUNCE_MS in BG_KEYS and a
+  waitFanin(350ms) settler; notify-matrix (5), s5-wake-voice (4), surface
+  idle (1), s4-lifecycle backoff-count (1), s6 M1-fence (1) and u2-pending
+  (6 + per-iteration serialize in the 21-cap loop) await the ≤200ms window
+  before wake-count/hook assertions. "0-wake" assertions needed no change
+  (unscheduled roads stay silent); DONE/toast/app.log/file assertions needed
+  no change (all synchronous inside notifyJob, before/around the schedule).
+
+## U4 — New tests (test/u4-fanin.test.ts, 8 its)
+
+Burst-coalesce (3×sleep-0.5 → exactly 1 wake, all ids, `3 jobs finished`,
+`0 remaining`, persisted-first DONE-before-wake); token-isolation (two
+parents → 1 wake each, disjoint id sets); remainingCount matrix (cap-1:
+stop-fanin sees pumped-running + still-queued as `2 remaining (1 running +
+1 queued)`, final wake `0 remaining`); persisted-first (max window: DONE +
+notified + notifications.log durable while wakes==0, then 1 wake);
+kill-switch (BG_U4_FANIN=0 → 2 rapid jobs wake twice, legacy road);
+garbage debounce (fallback to default window, 1 wake); busy-parent bundle
+(combined throw → 1 attempt, ONE `pending notifications (1)` bundle with
+both ids, second hook entry no-op); cross-site coalescing (natural +
+manual-stop share 1 wake with both ids).
+
+## U4 — Branch/waiver accounting (BRDA taken from coverage/lcov.info)
+
+New-code branches ALL taken, ZERO new waivers: lcov BRDA shows no untaken
+branch in 125-134 (parse/enable helpers), 1062-1115 (schedule/fire
+closures) or 1182-1215 (notifyJob road branch) — stale-token arm via burst
+timers, new/existing-parent arms via burst, single/plural header arms via
+single + burst tests, enable/disable arms via default + kill-switch tests,
+parse fallback/value arms via garbage + normal tests. Funcs 148/150 (+7 new
+all covered: isU4FaninEnabled, parseU4DebounceMs, scheduleU4Fanin,
+fireU4Fanin, timer callback, send IIFE, batch map); uncovered = standing
+F-002 (baseDir-throw funnel sort callback) + F-012 (setInterval tick) only.
+
+## U4 — Ticket impact
+
+- S4-COV-06/07/08/10(residual)/11/13/14 remain OPEN, untouched by U4 (no
+  production lines in their areas changed).
+- S4-COV-15 stays CLOSED. No new tickets. Waivers +0; standing waivers
+  (S4b-NEW-01/02/03, B-001–B-007, B-018/019, B-021, B-030, B-035,
+  B-042–B-048, B-064/065, B-068/069, B-090/091/097/098, B-103/104/105,
+  U1-W-01..04, U2-W-05, F-002, F-012) carried forward unchanged.
+
+## U4 re-proof (post-docs check-list for the pre-commit gate)
+
+- `npm test` → 277/277 green (24 files: 269 S0-U3 + 8 U4).
+- `npx vitest run --coverage` → Lines 100% (802/802); Branch 91.11%
+  (718/788, +15 taken vs U3, zero untaken in new ranges); Funcs 98.66%
+  (148/150, uncovered = standing F-002/F-012 only); Stmts 98.06%
+  (1063/1084).
+- `tsc --noEmit` → exit 0. `scripts/loader-guard.sh` → green (probe-1 all
+  exports functions, probe-2 7 exports unthrowable + 2 debouncers,
+  probe-3 manifest-acceptance exact: BackgroundOps+default + 5 helpers, 7
+  tools). `node --check` → all dist .js OK.
+  `test/boot-contract.test.ts` solo → 5/5.
+- Change set: src/plugin/background.ts (U4 consts + closures + notifyJob
+  road branch) + test/u4-fanin.test.ts (NEW, 8 its) + test/helpers.ts
+  (BG_KEYS +2, waitFanin) + notify-matrix/s5/surface/s4-lifecycle/s6/u2
+  waitFanin settles (waits only) + docs/coverage-ratchet.md (this U4
+  section), ALL uncommitted. No live writes, no repo logs/ (logs in
+  /tmp/ocbg-logs/).

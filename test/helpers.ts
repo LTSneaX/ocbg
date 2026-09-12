@@ -28,6 +28,8 @@ export const BG_KEYS = [
   "BG_SWEEP_BUDGET_MS",
   "BG_JOB_ID_TYPE",
   "BG_U2_TIMEOUT_MS",
+  "BG_U4_FANIN",
+  "BG_U4_DEBOUNCE_MS",
 ];
 
 let savedEnv: Record<string, string | undefined> = {};
@@ -215,4 +217,12 @@ export function wakeCalls(client: MockClient, rootSessionID: string): any[] {
   return client.session.promptAsync.mock.calls.filter(
     (c: any) => c?.[0]?.path?.id === rootSessionID,
   );
+}
+
+/** Wait out the U4 fan-in debounce window (default 100ms, max 200ms) plus
+ *  margin, so debounced parent wakes (and their U2 queue settlements) have
+ *  landed before wake-count assertions. Call after waitTerminal / list-driven
+ *  completion and before asserting wakeCalls / hook delivery. */
+export async function waitFanin(ms = 350): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
 }

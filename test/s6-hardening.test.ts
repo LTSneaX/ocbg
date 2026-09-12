@@ -20,6 +20,7 @@ import {
   readNotifications,
   projectDir,
   waitTerminal,
+  waitFanin,
   wakeCalls,
   completedMessages,
 } from "./helpers.js";
@@ -126,6 +127,7 @@ describe("S6 hardening", () => {
     );
     await plugin.tool.background_list.execute({}, owner); // pre-render refresh completes the task
     await waitTerminal(plugin, owner, id);
+    await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     // Wake note: the untrusted block carries no fence-breaking bytes.
     const wakes = wakeCalls(client, OWNER);
     expect(wakes.length).toBeGreaterThan(0);

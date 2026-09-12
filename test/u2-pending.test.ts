@@ -19,6 +19,7 @@ import {
   runId,
   readState,
   waitTerminal,
+  waitFanin,
 } from "./helpers.js";
 
 saveEnv();
@@ -62,6 +63,7 @@ describe("U2 pending-notification fallback", () => {
     const id = await runBash(plugin, owner, "echo throw-u2");
     const body = await waitTerminal(plugin, owner, id);
     expect(body).toContain("throw-u2"); // terminal lands despite the wake throw
+    await waitFanin(); // U4: debounced fan-in settles (and queues) before the hook
     const st = readState(home, dir, id);
     expect(st.summary).toContain("[DONE COMPLETED]"); // DONE marker still carried it
     // Next chat.message turn: pending drains into the message parts (turn-firing).
@@ -89,6 +91,7 @@ describe("U2 pending-notification fallback", () => {
     const elapsed = Date.now() - t0;
     expect(body).toContain("timeout-u2");
     expect(elapsed).toBeLessThan(5000); // 80ms race, not the 30s default, not a hang
+    await waitFanin(); // U4: debounced fan-in settles (and queues) before the hook
     expect(client.session.promptAsync.mock.calls.length).toBeGreaterThanOrEqual(1); // wake was attempted
     const out: any = { message: { parts: [{ type: "text", text: "user says hi" }] } };
     await (plugin as any)["chat.message"]({}, out);
@@ -105,6 +108,7 @@ describe("U2 pending-notification fallback", () => {
     const owner = makeCtx(OWNER, dir);
     const id = await runBash(plugin, owner, "echo ok-u2");
     await waitTerminal(plugin, owner, id);
+    await waitFanin(); // U4: debounced fan-in settles (and dequeues) before the hook
     expect(client.session.promptAsync.mock.calls.length).toBeGreaterThanOrEqual(1);
     const out: any = { message: { parts: [] } };
     await (plugin as any)["chat.message"]({}, out);
@@ -119,6 +123,7 @@ describe("U2 pending-notification fallback", () => {
     const owner = makeCtx(OWNER, dir);
     const id = await runBash(plugin, owner, "echo partroad-u2");
     await waitTerminal(plugin, owner, id);
+    await waitFanin(); // U4: debounced fan-in settles (and queues) before the hook
     const out: any = { parts: [] };
     await (plugin as any)["chat.message"]({}, out);
     expect(out.parts).toHaveLength(1);
@@ -133,6 +138,7 @@ describe("U2 pending-notification fallback", () => {
     const owner = makeCtx(OWNER, dir);
     const id = await runBash(plugin, owner, "echo requeue-u2");
     await waitTerminal(plugin, owner, id);
+    await waitFanin(); // U4: debounced fan-in settles (and queues) before the hook
     await (plugin as any)["chat.message"]({}, {}); // no parts anywhere → kept, not lost
     const out: any = { message: { parts: [] } };
     await (plugin as any)["chat.message"]({}, out); // following turn delivers
@@ -151,6 +157,7 @@ describe("U2 pending-notification fallback", () => {
     for (let n = 0; n < 21; n++) {
       const id = await runBash(plugin, owner, `echo cap-u2-${n}`);
       await waitTerminal(plugin, owner, id);
+      await waitFanin(); // U4: serialize — each fan-in queues before the next job lands
       ids.push(id);
     }
     const out: any = { message: { parts: [] } };
