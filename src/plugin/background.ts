@@ -1375,10 +1375,21 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
     "experimental.chat.system.transform": async (_input, output) => {
       output.system.push(`BACKGROUND OPS v${VERSION}: use background_run(kind="task"|"bash") to launch async work, continue immediately, then background_read(id) when ready. Terminal jobs signal via [DONE state] markers in background_list/summary when notify_on_complete (default true); always-on .notifications.log + app.log + toast — poll via background_list/background_read. Transcript wake-note injection is gated by BG_WAKE_NOTE (default ON = turn-firing reply-mode wake: arrival triggers parent action, auto-read + report unprompted; BG_WAKE_NOTE=false = zero transcript residue, delivery via DONE/toast/logs+polling). Live heartbeats visible in background_status. YOU own reporting: relay results to the human in your own words. Results persist under ~/.local/share/opencode/background-ops/.`);
     },
+    // S5/U5 rich compaction (THEIR running[] + unread[10] + read-hint shape):
+    // running[] carries ALL live ids; unread is capped at the 10 oldest with a
+    // "+N more" overflow note; the trailing read-hint gives the retrieval verb.
+    // Single push keeps the pre-S5 length-1 contract; empty stays silent (no
+    // push). Best-effort, never throws.
     "experimental.session.compacting": async (_input, output) => {
       try {
-        const active = [...jobs.values()].filter((j) => j.state === "running" || j.unread);
-        if (active.length) output.context.push(`Background jobs: running=[${active.filter((j) => j.state === "running").map((j) => j.id).join(",")}] unread=[${active.filter((j) => j.unread && j.state !== "running").map((j) => j.id).join(",")}]. Retrieve via background_read(id).`);
+        const running = [...jobs.values()].filter((j) => j.state === "running");
+        const unread = [...jobs.values()].filter((j) => j.unread && j.state !== "running");
+        if (!running.length && !unread.length) return;
+        const shown = unread.slice(0, 10);
+        const overflow = unread.length - shown.length;
+        const runIds = running.map((j) => j.id).join(",");
+        const unIds = shown.map((j) => `${j.id} [${j.state}]`).join(",");
+        output.context.push(`Background jobs: running=[${runIds}] unread=[${unIds}]${overflow > 0 ? ` (+${overflow} more)` : ""}. Retrieve full output via background_read(id).`);
       } catch { /* noop */ }
     },
   };

@@ -332,3 +332,92 @@ All in src/plugin/background.ts. Anonymous v8 labels resolved to enclosing expre
   dist/plugin/background.js → OK.
 - Change set: docs/coverage-ratchet.md (this file) ONLY, uncommitted. No production
   logic touched; no v8-ignore added/removed (12 lines / 11 regions unchanged).
+
+---
+
+# S5 wake-voice inventory (2026-09-12, S5 tree: HEAD 77ccf56 + uncommitted S5 delta)
+
+S5 is the first slice that touches production wake/compact code since the
+zero-rebuild: the turn-firing wake funnel (promptAsync WITHOUT noReply,
+terminal-only, mid-run no-op, BG_WAKE_NOTE kill-switch, single-writer notified
+guard, DONE-marker, capped .notifications.log) was already byte-complete from
+the r7 carry-forward and already covered by the G1 notify-matrix suite, so the
+S5 production delta is exactly ONE hook: `experimental.session.compacting`
+expanded from the one-line ids shape to the U5 rich shape (running[] ALL live
+ids + unread capped at the 10 oldest with a `(+N more)` overflow note +
+`background_read(id)` read-hint; single push keeps the pre-S5 length-1
+contract; empty stays silent; best-effort, never throws).
+
+Suite at inventory time: **227/227 green** (19 files, vitest 5.0.0; S5 adds 8
+its in test/s5-wake-voice.test.ts).
+Coverage at inventory time (`npx vitest run --coverage`, v8):
+**Lines 100% (632/632)** — S5 line gate HOLDS (+6 lines vs S4b, every one in
+the new compact hook, every one executed). Stmts 98.02% (843/860). **Branch
+91.64% (592/646)**. **Funcs 98.31% (117/119)** — net −1 function identity vs
+S4b (old hook: 5 arrows; new hook: 4 arrows), zero new uncovered functions
+(the 2 uncovered are the standing F-002/F-012 waivers, unchanged). No v8-ignore
+added/removed (12 lines / 11 regions unchanged).
+
+## S5 — New branches (4 arms, ALL COVERED, no waivers needed)
+
+Line numbers on the 1397-line S5 tree (src/plugin/background.ts):
+
+- S5-B-01 :1387 `!running.length && !unread.length` true-arm — COVERED:
+  pre-existing empty-compact tests (s4-lifecycle "stays quiet when empty").
+- S5-B-02 :1387 same-condition false-arm — COVERED: every non-empty compact
+  call (pre-existing running/unread tests + 2 new S5 compact tests).
+- S5-B-03 :1392 `overflow > 0` true-arm — COVERED: new S5 cap test (11 unread
+  bash jobs → `(+1 more)`, exactly 10 `[completed]` markers, oldest shown,
+  newest held back).
+- S5-B-04 :1392 `overflow > 0` false-arm — COVERED: new S5 rich-shape test
+  (1 running + 1 unread → no overflow note, `running=[id]`,
+  `<id> [completed]`, `background_read(` hint present).
+
+## S5 — New tests (test/s5-wake-voice.test.ts, 8 its)
+
+Wake-matrix throw/timeout-fallback arm (G1 covers ON/OFF × terminal/mid-run;
+S5 pins the fault arm + the reply-mode bytes):
+
+1. reply-mode contract: wake fires WITHOUT `noReply`, `[background-ops]`
+   trusted prefix, `Untrusted child output` fence, `background_read("<id>")`
+   read-hint.
+2. wake promptAsync sync-throw → terminal still lands, notified, DONE/toast/
+   app.log/.notifications.log all present (throw fallback).
+3. wake promptAsync rejection → same (rejection fallback, wake attempted once).
+4. wake surface missing (`promptAsync = undefined`) → fully silent wake, DONE/
+   toast/logs carry it (headless-parent fallback).
+5. toast rejection → DONE + notified still land (headless-TUI fallback).
+6. DONE-marker EISDIR fallback: planted RUNNING bash job with outputPath = a
+   directory → background_stop stays total (stopped + notified + `[DONE
+   STOPPED]` + exactly one wake + toast). Covers the stop-path read catch
+   (:774) and the notify-path read catch (:923) deterministically.
+7. compacting rich shape (see S5-B-04).
+8. compacting unread cap (see S5-B-03).
+
+Test-behavior note (pin for future slices): `background_read` clears `unread`,
+so compact-hook tests MUST poll the state file (`readState` loop), never
+`waitTerminal`/`background_read`, or the unread set evaporates before the
+hook runs (found red, fixed green in-S5).
+
+## S5 — Ticket impact
+
+- S4-COV-15 (event/compact) stays CLOSED: its residual compact arms are
+  covered, and the 4 new S5 compact arms are covered above.
+- S4-COV-06/07/08/10(residual)/11/13/14 remain OPEN, untouched by S5 (no
+  production lines in their areas changed).
+- Waivers carried forward unchanged (S4b-NEW-01/02/03, B-001–B-007, B-018/019,
+  B-021, B-030, B-035, B-042–B-048, B-064/065, B-068/069, B-090/091/097/098,
+  B-103/104/105, F-002, F-012).
+
+## S5 re-proof (post-docs check-list for the pre-commit gate)
+
+- `npm test` → 227/227 green (19 files).
+- `npx vitest run --coverage` → Lines 100% (632/632); Branch 91.64% (new arms
+  S5-B-01–04 all covered); Funcs 98.31% (uncovered = standing F-002/F-012).
+- `tsc --noEmit` → exit 0. `scripts/loader-guard.sh` → green (probe-3
+  manifest-acceptance incl). `node --check` → all dist .js OK.
+  `test/boot-contract.test.ts` solo → 5/5.
+- Change set: src/plugin/background.ts (compact hook ONLY, +11/−1 lines) +
+  test/s5-wake-voice.test.ts (NEW, 8 its) + docs/coverage-ratchet.md (this S5
+  section), ALL uncommitted. No live writes, no repo logs/ (logs in
+  /tmp/ocbg-logs/).
