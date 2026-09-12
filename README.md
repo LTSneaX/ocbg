@@ -94,7 +94,7 @@ Two rules: plugins load at server boot only (a new file on disk means nothing un
 | `background_run` | Start a subagent task or shell command without blocking | `kind` (`task`/`bash`), `prompt`, `timeout_minutes` (default 1440 = 24h), `notify_on_complete` (default true) |
 | `background_list` | See every job: id, kind, state, one-line summary | — |
 | `background_status` | Check live jobs: heartbeat age, current step, concurrency | `id` (optional; omit for all running) |
-| `background_read` | Get the full persisted result of a finished job | `id` |
+| `background_read` | Get the full persisted result of a finished job | `id`, `wait_ms` (optional, default 0 = instant; >0 blocks up to the deadline-capped budget, then falls back to `[running]`) |
 | `background_steer` | Send a follow-up instruction into a running task (max 5; deadline never moves) | `id`, `instruction` |
 | `background_stop` | Abort a running job; partial output is kept | `id` |
 | `background_config` | Print current config, limits, and env override names (read-only) | — |
@@ -114,6 +114,7 @@ Every finished job emits through one funnel, so natural completions, manual stop
 
 - **Wake turn.** By default the transcript takes an unprompted turn on finish: the result is read and reported in the agent's own words. Set `BG_WAKE_NOTE=false` to skip the wake entirely (zero transcript residue) — toasts, DONE markers, and both logs keep working.
 - **Per-job quiet.** Pass `notify_on_complete: false` to silence one job's wake, toast, and DONE marker. The result is still saved, and the file + `app.log` entries still fire.
+- **Burst coalescing (default ON).** N near-simultaneous terminals to one parent arrive as ONE wake (`N jobs finished, M remaining`), with every job's note bytes + read-hint preserved; DONE markers, toasts-per-job, and both logs still fire per job. Set `BG_U4_FANIN=0` to restore one wake per job.
 - **Always-on logs.** `.notifications.log` (JSON lines, per project under `~/.local/share/opencode/background-ops/`) and a structured `app.log` event (`background-ops`) are written on every terminal state, even gated-quiet ones.
 - **Timeouts are stops.** A job past its deadline is aborted and reported as stopped with its partial output preserved — steer cannot extend a deadline; start a new run instead.
 
@@ -123,7 +124,7 @@ Lifecycle: `run` → live heartbeats per step → terminal funnel (completed / f
 
 - **Persistence.** Each job keeps a Markdown result, a JSON state record, and a heartbeat trail under `~/.local/share/opencode/background-ops/<project>/`, plus one shared `.notifications.log` per project. Finished results stay readable by id. Terminal results older than `BG_RETENTION_DAYS` (default 7) are pruned; both append-only logs keep the most recent 200 lines.
 - **Idle reaper.** About every 60 seconds a sweep checks running jobs. A job closes only when *both* its heartbeat *and* its child/output activity prove silence for the idle window (default 3 minutes). Any doubt skips to the next sweep; a genuine completion that lands mid-sweep always wins.
-- **Guards.** Reading, steering, and stopping a job are restricted to the session that created it (anything else gets a fail-closed not-found); lists and status stay visible from any session by design. Deadlines are immutable with a 5-steer cap. Job files are written with private permissions (0700 dirs, 0600 files). Untrusted child output is single-line capped and framed before it reaches summaries or wake text. Starting a background run from inside a background child is rejected — do the work directly instead.
+- **Guards.** Reading, steering, and stopping a job are restricted to the session that created it (anything else gets a fail-closed not-found); lists and status stay visible from any session by design. Deadlines are immutable with a 5-steer cap. Job files are written with private permissions (0700 dirs, 0600 files). Untrusted child output is single-line capped and framed before it reaches summaries or wake text. Starting a background run from inside a background child is rejected — do the work directly instead (child dispatches carry `tools: { background_run: false }` and the before-hook pattern-denies `background_run` variants while passing all sibling tools).
 - **Limits.** 10 concurrent jobs (extras queue), 24-hour default timeout (cap 48 hours via `BG_MAX_TIMEOUT_MINUTES`; explicit `timeout_minutes` overrides win), 4096-byte shell command cap, random unguessable ids by default.
 
 Details: `docs/internals.md`.
@@ -143,6 +144,8 @@ Set in the environment (e.g. `~/.config/opencode/.env`) **before boot**. Default
 | `BG_NOTIFY_DEFAULT` | `true` | You want new jobs quiet by default (results are still saved) |
 | `BG_IDLE_CLOSE_MS` | `180000` (3m) | Good jobs get reaped (raise it) or dead jobs linger (lower it); bad values fall back to 3m |
 | `BG_WAKE_NOTE` | `true` | `false` = no transcript wake; poll via list, toasts, and logs instead |
+| `BG_U1_ENRICH` | unset (OFF) | `1` = post-terminal LLM title/summary enrichment (one model call per terminal job, 30s race, DONE-marker-preserving); unset = truncation titles only |
+| `BG_U4_FANIN` | unset (ON) | `0` = one wake per job (legacy road); unset = burst terminals coalesce into one wake |
 
 The two that matter, commented:
 
@@ -185,13 +188,13 @@ Structural test-before-landing enforcement: no red suite lands on `main`.
 
 - **Pre-push hook.** Install once after cloning: `sh scripts/install-hooks.sh`. Every `git push` then runs `npm run typecheck` + `npm test` first — a red suite exits non-zero and blocks the push. Source of truth is `scripts/pre-push.sh`; never edit `.git/hooks/pre-push` in place, re-run the installer instead.
 - **CI.** `.github/workflows/ci.yml` runs the same gate (`npm ci`, `npx tsc --noEmit`, `npm test`) on every push and pull request. A red run blocks the merge.
-- **Suite.** `npm test` runs the real suite (S6: 20 files, 233 tests green) incl. the `dist/` boot-contract; `npx vitest run --coverage` must hold lines 100% (S6: 632/632).
-- **Slices.** Shipped slice history lives in `docs/history.md` + `docs/coverage-ratchet.md`; S6 = hardening (steer wording, M1/title fences, state-only timeout labels, gitignore hygiene).
+- **Suite.** `npm test` runs the real suite (U567: 25 files, 282 tests green) incl. the `dist/` boot-contract; `npx vitest run --coverage` must hold lines 100% (U567: 804/804).
+- **Slices.** Shipped slice history lives in `docs/history.md` + `docs/coverage-ratchet.md`; S0-S2 boot/persistence (`a4d78a3`) → S3 queue-pump (`606bd9e`) → CI dist-fix (`32136b7`) → S4 lifecycle (`77ccf56`) → S5 wake-voice (`060c2ae`) → S6 hardening (`a8a0c13`) → U1 enrichment opt-in (`b7b38c6`) → U2 pending fallback (`b897922`) → U3 blocking read (`d8f2018`) → U4 fan-in (`2516505`) → U567 compact-hint + child-deny + projectId audit (`34315af`).
 
 ## Docs
 
 - `docs/api.md` — full tool parameter reference
-- `docs/config.md` — all 8 `BG_` variables in depth
+- `docs/config.md` — all `BG_` variables in depth
 - `docs/internals.md` — lifecycle, reaper, and guards
 - `docs/troubleshooting.md` — full troubleshooting tree
 - `docs/history.md` — complete project history with version SHAs
