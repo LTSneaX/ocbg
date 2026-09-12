@@ -211,6 +211,92 @@ poll/timeout matrix) · S4-COV-11 (bash refresh matrix) · S4-COV-12 (lookup sha
 S4-COV-13 (sweep races) · S4-COV-14 (tool-surface fallbacks) · S4-COV-15 (event/compact).
 Waivers: all rationale-tagged defensive/host-scream/log-only/dead-by-construction.
 
+---
+
+# S4b backfill inventory (2026-09-12, S4a tree: HEAD 32136b7 + untracked test/s4-lifecycle.test.ts + test/s4-reaper.test.ts)
+
+Suite at inventory time: **219/219 green** (18 files, vitest 5.0.0; S4a added 73 its:
+56 lifecycle + 17 reaper).
+Coverage at inventory time (`npx vitest run --coverage`, v8):
+**Lines 100% (626/626)** — S4b line gate HOLDS, zero uncovered lines, no backfill
+tests required for lines. Stmts 98.01% (838/855 → 17 uncovered, every one shares
+its line with a covered statement, hence lines stay 100%). **Branch 91.61%
+(590/644 → 54 uncovered, down from 116 at S3b)**. **Funcs 98.33% (118/120 → 2
+uncovered, down from 14 at S3b)**.
+
+S4a progress vs S3b: S4-COV-01/02/03/04/05/09/10(partial)/12/15 CLOSED at branch
+level (heartbeat matrix, deadline-skip, pool misuse, envelope matrix, prune matrix,
+notify guards, lookup shapes, event/compact — zero residual uncovered branches).
+S4-COV-06/07/08/10(residual)/11/13/14 remain OPEN (see below). No production logic
+touched by S4b; this section is docs-only.
+
+## S4b — Uncovered branches (54, `npx vitest run --coverage --coverage.reporter=json`)
+
+Carry-forward S3b IDs where the code is unchanged (line numbers re-verified on the
+1386-line tree); every item keeps its S3b disposition unless noted.
+
+WAIVER (defensive/host-scream/log-only/dead-by-construction, keep uncovered):
+- :123 binary-expr (B-001), :132 if (B-002), :265/:281/:302/:304 timer guards
+  (B-004–B-007), :473 (B-021 stat-failure), :493 `?? {}` (B-030), :528 (B-035
+  stat-failure), :639-adjacent dbg ternaries :663/:669×3/:670×3 (B-042–B-048,
+  log-strings), :848/:853 (B-064/065 dead-by-ordering), :927×2 (B-068/069
+  catch-stringify), :1042/:1044/:1058/:1062 (B-090/091/097/098 silence-guard
+  fail-closed arms — covering them would mean PROVING a reap, inverted incentive),
+  :1245/:1260 (B-103/104 host directory), :1266 (B-105 endedAt ordering).
+- S4b-NEW-01 :586 `catch { return pruned; }` (pruneOldJobs readdirSync funnel) —
+  WAIVER: fires only if the job dir becomes unreadable between baseDir-mkdir and
+  readdir (disk failure / revoked perms mid-sweep); host-scream, needs fault
+  injection between two adjacent syscalls, untestable deterministically.
+- S4b-NEW-02 :177 `catch { return; }` (hardenPerms readdirSync funnel) — WAIVER:
+  same class as S4b-NEW-01 (mkdir just succeeded, readdir fails = disk yanked);
+  host-scream, best-effort posture is the documented contract.
+- S4b-NEW-03 :60 `catch { return false; }` (bgDebugEnabled env-access funnel) —
+  WAIVER: process.env property access throws only under a hostile loader membrane;
+  host-scream guard, one-line total function.
+
+TICKET (testable, deferred — S4-COV series stays open, S5+ may claim):
+- S4-COV-06 (cache-overlap): :612 `seen.has` continue, :639 `if (!live)` — needs
+  in-memory/disk overlap double-boot test.
+- S4-COV-07 (dispatch error funnel): :699 `__bgError` arm — needs promptAsync
+  rejection injection.
+- S4-COV-08 (stop/complete races): :741/:768/:797 `jobs.get ?? job` right-arms,
+  :754 `timeoutMinutes > 0` false-arm, :771 post-abort recheck — needs stale-ref /
+  abort-race fault injection.
+- S4-COV-10 (task poll/timeout residual): :937 stale-ref, :948 skip-gate true-arm
+  (fresh-heartbeat skip integration needs time-travel), :983 legacy-timeout arms.
+- S4-COV-11 (bash refresh matrix): :1004 stale-ref, :1005 kind/state guard,
+  :1009 close-race, :1011 non-zero-exit arm, :1019/:1021 timeout/legacy arms.
+- S4-COV-13 (sweep races): :1101 completion-won, :1113 stale-ref, :1114
+  non-running return — needs sweep-vs-complete race orchestration.
+- S4-COV-14 (tool-surface fallbacks): :1222 no-timeout run, :1275/:1292/:1309
+  read/steer/stop disk-fallback (evicted-job) arms.
+
+## S4b — Uncovered functions (2)
+
+- FN:606 allKnownJobsFresh `catch { return out.sort(...) }` baseDir-throw funnel
+  (F-002) — WAIVER: baseDir throws only on unresolvable cwd (host-scream).
+- FN:1175 setInterval tick `() => { sweepIdleJobs().catch(...) }` (F-012) —
+  WAIVER: timer callback never fires under the fake-timer-less suite; armed-once
+  covered, tick is live-only.
+
+## S4b — Uncovered statements (17, all line-shared → lines 100% unaffected)
+
+:60 (S4b-NEW-03) · :132 (B-002) · :177 (S4b-NEW-02) · :473 (B-021) · :586
+(S4b-NEW-01) · :606×2 (F-002) · :768 (B-057) · :771 (B-058/059) · :798 (B-061) ·
+:948 (B-071) · :1005 (B-083) · :1042/:1044/:1058/:1062 (B-090/091/097/098) ·
+:1114 (B-101). Each shares its line with a covered statement/branch arm; no
+line-level action. No v8-ignore added (12 lines / 11 regions unchanged).
+
+## S4b re-proof (post-docs, production code untouched)
+
+- `npm test` → 219/219 green (18 files).
+- `npx vitest run --coverage` → Lines 100% (626/626); Branch 91.61% (54 named
+  above); Funcs 98.33% (2 named above); Stmts 98.01% (17 named above).
+- `tsc --noEmit` → exit 0. `scripts/loader-guard.sh` → green (probe-3
+  manifest-acceptance incl). `node --check` → all 21 dist .js OK.
+  `test/boot-contract.test.ts` solo → 5/5.
+- Change set: docs/coverage-ratchet.md (this S4b section) ONLY, uncommitted.
+
 ## F — Uncovered functions (14, FNDA=0 from lcov.info)
 
 All in src/plugin/background.ts. Anonymous v8 labels resolved to enclosing expressions:
