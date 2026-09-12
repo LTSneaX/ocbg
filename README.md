@@ -185,6 +185,8 @@ Structural test-before-landing enforcement: no red suite lands on `main`.
 
 - **Pre-push hook.** Install once after cloning: `sh scripts/install-hooks.sh`. Every `git push` then runs `npm run typecheck` + `npm test` first — a red suite exits non-zero and blocks the push. Source of truth is `scripts/pre-push.sh`; never edit `.git/hooks/pre-push` in place, re-run the installer instead.
 - **CI.** `.github/workflows/ci.yml` runs the same gate (`npm ci`, `npx tsc --noEmit`, `npm test`) on every push and pull request. A red run blocks the merge.
+- **Suite.** `npm test` runs the real suite (S6: 20 files, 233 tests green) incl. the `dist/` boot-contract; `npx vitest run --coverage` must hold lines 100% (S6: 632/632).
+- **Slices.** Shipped slice history lives in `docs/history.md` + `docs/coverage-ratchet.md`; S6 = hardening (steer wording, M1/title fences, state-only timeout labels, gitignore hygiene).
 
 ## Docs
 

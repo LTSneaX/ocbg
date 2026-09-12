@@ -421,3 +421,89 @@ hook runs (found red, fixed green in-S5).
   test/s5-wake-voice.test.ts (NEW, 8 its) + docs/coverage-ratchet.md (this S5
   section), ALL uncommitted. No live writes, no repo logs/ (logs in
   /tmp/ocbg-logs/).
+
+---
+
+# S6 hardening inventory (2026-09-12, S6 tree: HEAD 060c2ae + uncommitted S6 delta)
+
+S6 is hardening-only: four same-line production edits, zero new lines, zero
+new branch arms. The suite grows by 6 its (new test/s6-hardening.test.ts) and
+one contract update (deadline-steer substring test → state-only expectation).
+
+Suite at inventory time: **233/233 green** (20 files, vitest 5.0.0; S6 adds 6:
+steer-wording pin, title-creation fence, list-render fence, legacy-title
+fence, hostile-completion M1 fence, stop-past-deadline secondary arm).
+Coverage at inventory time (`npx vitest run --coverage`, v8):
+**Lines 100% (632/632)** — S6 line gate HOLDS (+0 lines: every edit is
+same-line). Stmts 98.02% (843/860, unchanged). **Branch 91.61% (590/644)** —
+numerator AND denominator each −2 vs S5 (592/646): the removed tertiary
+`/timeout/i` disjunct drops its two arms (both previously covered by the old
+substring test), so the percentage is byte-identical and no coverage is lost.
+**Funcs 98.31% (117/119)** — unchanged (standing F-002/F-012 waivers). No
+v8-ignore added/removed (12 lines / 11 regions unchanged). The "Uncovered
+Line #s" column again lists partial-branch lines only (same class as S4b/S5);
+lines 632/632 = zero uncovered lines.
+
+## S6 — Production deltas (src/plugin/background.ts, all branch-free)
+
+- S6-D-01 cleanSingleLine backticks (:78): adds `.replace(/`/g, "")` to the
+  existing chained-replace pipeline + comment mentions ``` markdown-fence
+  breakout. String.replace with a regex (no callback) adds no branch arms.
+- S6-D-02 title creation fence (:1223): `title:` wrapped in
+  `cleanSingleLine(...)` (pure call, no new arms). Stored titles are now
+  single-line ≤120 chars with no `"`/backticks going forward.
+- S6-D-03 list render title fence (:1250): `${j.title}` → 
+  `${cleanSingleLine(j.title)}` (pure call, no new arms). Covers legacy
+  on-disk titles predating S6-D-02.
+- S6-D-04 isTimeout state-only (:849-855): removes the tertiary
+  `(live.timedOut === undefined && /timeout/i.test(live.summary))` disjunct +
+  comment rewrite (tertiary → gone). Timeout labels now derive from the
+  timedOut flag (primary) or stopped-at/past-deadline (secondary) only —
+  untrusted summary text can no longer vote on the event label. Removes 2
+  covered branch arms (see counts above).
+- Steer wording: already `deadline NOT extended` (:1289 description, :1302
+  return) — S6 pins it with a test, zero code change.
+
+## S6 — New/updated tests
+
+- test/s6-hardening.test.ts (NEW, 6 its): steer description wording pin
+  (contains `deadline NOT extended`, no `extends timeout window`); hostile
+  prompt → stored title single-line, no quotes/backticks, `task:` prefix,
+  ≤120 chars; hostile title → list keeps one line per job, head clean;
+  planted legacy title with separators → list renders single-line; hostile
+  task completion (newlines + quotes + ``` + `"""` + injection text) →
+  wake-note inner block and DONE summary carry no `"`/backtick/newline;
+  stop-past-deadline with no flag → event `timeout` (secondary arm).
+- test/deadline-steer.test.ts (UPDATED, 1 it): the old `substring fallback`
+  test is rewritten as `S6 state-only` — same setup (steer mentioning
+  "timeout", then manual stop), now expects event `stopped`. This is the S6
+  contract change, not a coverage loss: the removed arms leave the tree.
+- Test-behavior note (extends the S5 pin): task completion in tests needs the
+  `background_list` pre-render refresh before `waitTerminal`; `background_read`
+  alone never polls. And wake-note assertions must scope to the INNER
+  untrusted block — the trusted `"""` delimiters are framing, not payload.
+
+## S6 — Ticket impact
+
+- S4-COV-06/07/08/10(residual)/11/13/14 remain OPEN, untouched by S6 (no
+  production lines in their areas changed).
+- S4-COV-15 stays CLOSED. No new tickets, zero new waivers.
+- Waivers carried forward unchanged (S4b-NEW-01/02/03, B-001–B-007,
+  B-018/019, B-021, B-030, B-035, B-042–B-048, B-064/065, B-068/069,
+  B-090/091/097/098, B-103/104/105, F-002, F-012).
+
+## S6 re-proof (post-docs check-list for the pre-commit gate)
+
+- `npm test` → 233/233 green (20 files).
+- `npx vitest run --coverage` → Lines 100% (632/632); Branch 91.61%
+  (delta −2/−2 from the removed tertiary arms, % unchanged); Funcs 98.31%
+  (uncovered = standing F-002/F-012).
+- `tsc --noEmit` → exit 0. `scripts/loader-guard.sh` → green (probe-3
+  manifest-acceptance incl). `node --check` → all dist .js OK.
+  `test/boot-contract.test.ts` solo → 5/5.
+- Change set: src/plugin/background.ts (4 same-line hardening edits) +
+  test/s6-hardening.test.ts (NEW, 6 its) + test/deadline-steer.test.ts
+  (1 contract update) + .gitignore (tmp/log hygiene append) + README.md
+  (+2 Development bullets, 203→205 lines, same headings/order) +
+  docs/coverage-ratchet.md (this S6 section), ALL uncommitted. No live
+  writes, no repo logs/ (logs in /tmp/ocbg-logs/).

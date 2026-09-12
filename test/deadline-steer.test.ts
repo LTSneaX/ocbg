@@ -1,6 +1,7 @@
 // G4 — deadline immutability + steer cap (L2) + timeout labeling.
 // Steer storm: 10 steers => 5 succeed, 5 capped, deadlineAt byte-identical.
-// Timeout label: timedOut flag vs stopped-at-deadline vs substring fallback.
+// Timeout label: timedOut flag vs stopped-at-deadline (S6: state-only —
+// untrusted summary text never votes on the label).
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
@@ -117,7 +118,7 @@ describe("G4 deadline + steer", () => {
     expect(readNotifications(home, dir).find((n: any) => n.id === id)?.event).toBe("timeout");
   });
 
-  it("substring fallback: stopped job with 'timeout' in summary labels timeout (flag undefined)", async () => {
+  it("S6 state-only: stopped job with 'timeout' in summary labels stopped (flag undefined)", async () => {
     const t = await pendingTask();
     await t.plugin.tool.background_steer.execute(
       { id: t.id, instruction: "investigate the timeout path" },
@@ -128,8 +129,9 @@ describe("G4 deadline + steer", () => {
     expect(st.state).toBe("stopped");
     expect(st.timedOut).toBeUndefined();
     expect(st.summary).toContain("timeout");
-    // tertiary fallback: summary substring wins for legacy/flagless records
-    expect(readNotifications(home, t.dir).find((n: any) => n.id === t.id)?.event).toBe("timeout");
+    // S6: untrusted summary text no longer votes — manual stop before the
+    // deadline labels stopped even though the steer history says "timeout".
+    expect(readNotifications(home, t.dir).find((n: any) => n.id === t.id)?.event).toBe("stopped");
   });
 
   it("default timeout is 24h (1440m): timeoutMinutes + deadlineAt window", async () => {
