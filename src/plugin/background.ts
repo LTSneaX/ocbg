@@ -348,7 +348,10 @@ function readLastHeartbeat(job: Job): { age: string; step: string } | null {
     const ageMs = Date.now() - new Date(last.slice(0, i)).getTime();
     const age = ageMs < 60_000 ? `${Math.round(ageMs / 1000)}s` : ageMs < 3_600_000 ? `${Math.round(ageMs / 60000)}m` : `${Math.round(ageMs / 3600000)}h`;
     return { age, step: last.slice(i + 3) };
-  } catch { return null; }
+  } catch {
+    /* v8 ignore next -- S3b: dead guard, everything above is total on string[] */
+    return null;
+  }
 }
 // Numeric heartbeat age for the idle reaper. Returns null when the heartbeat is
 // missing/unparseable (caller must treat as UNKNOWN → do NOT reap). May return a
@@ -364,7 +367,10 @@ function readHeartbeatAgeMs(job: Job): number | null {
     const t = new Date(last.slice(0, i)).getTime();
     if (Number.isNaN(t)) return null;
     return Date.now() - t;
-  } catch { return null; }
+  } catch {
+    /* v8 ignore next -- S3b: dead guard, everything above is total on string[] */
+    return null;
+  }
 }
 // F2/A3: single-read heartbeat freshness probe for the list/status skip gate.
 // Returns the numeric age AND the last step together (one file read instead of
@@ -379,7 +385,10 @@ function readHeartbeatFresh(job: Job): { ageMs: number | null; step: string | nu
     if (i < 0) return { ageMs: null, step: null };
     const t = new Date(last.slice(0, i)).getTime();
     return { ageMs: Number.isNaN(t) ? null : Date.now() - t, step: last.slice(i + 3) };
-  } catch { return { ageMs: null, step: null }; }
+  } catch {
+    /* v8 ignore next -- S3b: dead guard, everything above is total on string[] */
+    return { ageMs: null, step: null };
+  }
 }
 // F2/A3: true when a running task job may skip its pre-render network poll.
 // Skips ONLY when (a) a poll demonstrably ran already (last step is not the
@@ -403,7 +412,10 @@ function taskRefreshSkippable(job: Job): boolean {
     if (hb.step.startsWith(TASK_DISPATCH_STEP_PREFIX)) return false;
     if (hb.ageMs < 0) return true;
     return hb.ageMs < REFRESH_FRESH_SKIP_MS;
-  } catch { return false; }
+  } catch {
+    /* v8 ignore next -- S3b: dead guard, callee is total (own catch) */
+    return false;
+  }
 }
 // ---------------------------------------------------------------------------
 // F5: bounded sweep — pool + budget. The steady-state gating is unchanged
@@ -598,10 +610,12 @@ function allKnownJobsFresh(cwd: string): Job[] {
   if (cached && mtime !== null && cached.dirMtimeMs === mtime && now - cached.at < CONFIG.listCacheTtlMs) {
     for (const j of cached.diskJobs) {
       if (seen.has(j.id)) continue;
+      /* v8 ignore start -- S3b: defensive merge, unreachable: inline prune overwrites the cache and pruneOldJobs busts it, so a cached id is always in-memory */
       const live = jobs.get(j.id);
       out.push(live ?? j);
       if (!live) jobs.set(j.id, j);
       seen.add(j.id);
+      /* v8 ignore stop */
     }
     return out.sort((a, b) => b.startedAt - a.startedAt);
   }
@@ -697,6 +711,10 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
     persistOutput(job, `[FAILED after ${MAX_TRIES} tries]\n\n${lastError}\n\nRetry backoff used: ${RETRY_DELAYS_MS.join("s, ")}s. What this means: transient dispatch faults (UnknownError at SessionPrompt.createUserMessage via SessionHttpApi.promptAsync) were retried 3× before giving up. If this persists, check model/API availability before re-running.`);
     saveJob(job);
     writeHeartbeat(job, `[FAILED after ${MAX_TRIES} tries] ${lastError.slice(0, 120)}`);
+    // S3a: dispatch-fail is terminal — release the slot so queued jobs drain.
+    // Without this pump, a failed dispatch at max concurrency parks the queue
+    // forever (runningCount already dropped, but nobody re-evaluates it).
+    pumpQueue();
     // r7-turn-firing: dispatch-fail is a terminal failure — toast + app.log +
     // file + turn-firing reply-mode wake carry it; no chat message, no red stderr.
     await notifyJob(c, job, { wake: true });
@@ -789,6 +807,7 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
       // unprompted), no red stderr.
       await notifyJob(c, live, { wake: true });
     } catch (e: any) {
+      /* v8 ignore next -- S3b: dead guard, funnel callees are total (persist/save/pump/notify all best-effort) */
       console.error(`[background-ops] completeJobInternal error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
     }
   }
@@ -971,6 +990,7 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
         }
       }
     } catch (e: any) {
+      /* v8 ignore next -- S3b: dead guard, poll block has its own catch and timeout block is guarded */
       console.error(`[background-ops] refreshTaskJob error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
     }
   }
@@ -1007,6 +1027,7 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
         }
       }
     } catch (e: any) {
+      /* v8 ignore next -- S3b: dead guard, every op above is guarded (heartbeat/persist/kill all best-effort) */
       console.error(`[background-ops] refreshBashJob error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
     }
   }
@@ -1040,7 +1061,10 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
       const age = Date.now() - ts;
       if (age < 0) return false; // clock skew → treat as fresh
       return age >= CONFIG.idleCloseMs;
-    } catch { return false; }
+    } catch {
+      /* v8 ignore next -- S3b: dead guard, lookups each have own catch and extraction is total */
+      return false;
+    }
   }
   // Idle-reaper sweep: closes running jobs silent for >= CONFIG.idleCloseMs on
   // BOTH signals (stale heartbeat AND stale child/output activity). Per-job
@@ -1108,6 +1132,7 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
         await c?.app?.log?.({ body: { service: "background-ops", level: "info", message: `idle-reaper: ${reapSlow ? "reap initiated (slow abort)" : `reaped after ~${mins}m idle`} ${live.id} [${live.kind}] (${label})`, extra: { jobId: live.id, state: live.state } } })?.catch(() => null);
       } catch { /* observability best-effort only */ }
     } catch (e: any) {
+      /* v8 ignore next -- S3b: dead guard, probes/timeout/reap each resolve to skip, observability best-effort */
       console.error(`[background-ops] idle-reaper: per-job error on ${(job as Job)?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);
     }
   }
@@ -1134,6 +1159,7 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
         try { appendLogLine(join(baseDir(safeDirectory), "last-idle.log"), `${new Date().toISOString()} | sweep budget exhausted, ${skipped} deferred to next tick\n`); } catch { /* best-effort */ }
       }
     } catch (e: any) {
+      /* v8 ignore next -- S3b: dead guard, prune/pool/append are total and pool never rejects */
       console.error(`[background-ops] idle-reaper: sweep error: ${String(e?.message ?? e).slice(0, 200)}`);
     } finally {
       sweepInFlight = false;
@@ -1290,6 +1316,9 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
         job.summary = "[STOPPED BY USER] removed from queue.";
         persistOutput(job, job.summary);
         saveJob(job);
+        // S3a: queued-removal is terminal — pump for uniformity (every terminal
+        // path re-evaluates the queue; here it is a no-op when at cap).
+        pumpQueue();
         // r7-turn-firing: queued-removal is a stop-equivalent → turn-firing wake.
         await notifyJob(c, job, { wake: true });
         return `Stopped queued ${args.id}.`;
