@@ -852,3 +852,77 @@ F-002 (baseDir-throw funnel sort callback) + F-012 (setInterval tick) only.
   waitFanin settles (waits only) + docs/coverage-ratchet.md (this U4
   section), ALL uncommitted. No live writes, no repo logs/ (logs in
   /tmp/ocbg-logs/).
+
+## U567 fast-follow — audit-first, build-only-gaps (U5-expand + U6 + U7)
+
+Audit (against Brain 2937d0bdd090434dbeb3a480575bd909 U5/U6/U7 + blueprint
+1a0ab3783b054a2aba3d5e5f11972a10 §5, HEAD 2516505):
+
+- U5 rich compaction: running ids PRESENT (runIds, ALL live), unread cap 10
+  PRESENT (slice(0,10) + overflow note), retrieval-hint bytes THIN (one
+  generic sentence). Gap built: hint expanded to BOTH verbs
+  (`background_read(id)` for full output + `background_status` for live
+  progress) so a compacted parent knows which tool retrieves what. Pre-U567
+  `background_read(` substring kept — S5 compact tests unaffected.
+- U6 child anti-recursion: tools flag on child prompt MISSING (body was
+  parts+agent+model only); deny parser EXACT-MATCH only
+  (`input.tool === "background_run"`, blind to namespaced/aliased variants).
+  Gaps built: (a) declarative layer — child dispatch promptAsync body gains
+  `tools: { background_run: false }` (CHILD_DENIED_TOOLS const, spread copy
+  per dispatch; pass-through key, hosts that ignore it behave as before;
+  write-capable stays — no other tool flagged); (b) enforcing layer —
+  module-private `isBackgroundRunTool` pattern-aware parser (substring token
+  match: denies exact + `BackgroundOps_background_run`-style variants, passes
+  all six sibling tools + non-string/empty fail-open, total by construction
+  with NO try/catch so no uncoverable catch line exists); before-hook
+  reordered to `childSessions.has(input?.sessionID) &&
+  isBackgroundRunTool(input?.tool)` with optional chaining (loader-shape
+  `{}`/`undefined` invocations stay total). Existing owner-gates fence tests
+  assert identical allow/deny on the exact-match road.
+- U7 stable projectId: NO GAP — S2 base already git-aware (git root-SHA via
+  `rev-parse --show-toplevel` with 5s timeout, else sha1(cwd)) with
+  BG_PROJECT_ID flag-default safety (override only when non-empty and not
+  `git`/`auto`). Audit-only, zero production lines touched.
+
+## U567 — New tests (test/u567-fastfollow.test.ts, 5 its)
+
+U5 both-verbs (disk-poll wait preserves unread, asserts `background_read(`
++ `background_status`); U6 tools-flag (child dispatch body.tools deep-equals
+`{background_run:false}`); U6 pattern-deny (exact + namespaced denied in
+child, all six siblings pass in child, owner passes, numeric/empty tool
+fail-open, `{}`+`undefined` total); U7 flag-default (unset/empty/git/auto
+boots land all four jobs under ONE project dir); U7 pin control
+(non-default value still sha1-pins deterministically).
+
+## U567 — Branch/waiver accounting
+
+New-code lines ALL executed, ZERO new waivers: CHILD_DENIED_TOOLS const at
+module top-level (import-executed); isBackgroundRunTool body on every
+before-hook call (hook fires in boot-contract/owner-gates/U567 suites);
+reordered hook arms via U567 pattern-deny matrix (deny/pass/loader-shape);
+tools-spread dispatch line on every task test; expanded hint line on every
+compacting test. `isBackgroundRunTool` deliberately try/catch-free (pure
+typeof-narrowed reads cannot throw) — no dead catch line to waive. Funcs
++1 (isBackgroundRunTool, covered); uncovered = standing F-002/F-012 only.
+No new exports (grep ^export unchanged: 7 standing + default).
+
+## U567 — Ticket impact
+
+- S4-COV-06/07/08/10(residual)/11/13/14 remain OPEN, untouched by U567 (no
+  production lines in their areas changed).
+- S4-COV-15 stays CLOSED. No new tickets. Waivers +0; standing waivers
+  carried forward unchanged.
+
+## U567 re-proof (post-docs check-list for the pre-commit gate)
+
+- `npm test` → 282/282 green (25 files: 277 U4 + 5 U567).
+- `npx vitest run --coverage` → Lines 100%; Branch ~91% (no untaken branch
+  in U567 ranges); Funcs (uncovered = standing F-002/F-012 only).
+- `tsc --noEmit` → exit 0. `scripts/loader-guard.sh` → green (probe-1 all
+  exports functions, probe-2 unthrowable + debouncers, probe-3
+  manifest-acceptance exact: BackgroundOps+default + 5 helpers, 7 tools).
+  `node --check` → all dist .js OK. `test/boot-contract.test.ts` solo → 5/5.
+- Change set: src/plugin/background.ts (U5 hint bytes + U6 const/parser/hook
+  + dispatch tools spread; U7 audit-only) + test/u567-fastfollow.test.ts
+  (NEW, 5 its) + docs/coverage-ratchet.md (this U567 section), ALL
+  uncommitted. No live writes, no repo logs/ (logs in /tmp/ocbg-logs/).

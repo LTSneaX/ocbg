@@ -180,6 +180,34 @@ function extractEnrichmentText(v: unknown): string | null {
     return null; // throwing shape → keep truncation
   }
 }
+// ---------------------------------------------------------------------------
+// U6: child anti-recursion, second layer (competitive-sweep upgrade U6, kdco
+// child-prompt tools:{task:false...} + isPermissionDenied pattern-deny
+// analogue). The tool.execute.before hook below stays the ENFORCING layer
+// (a child that calls background_run gets a shaped throw); this is the
+// DECLARATIVE layer: the child dispatch prompt carries
+// tools:{background_run:false} so a well-behaved host never offers the tool
+// inside the child turn at all (defense in depth — deny even if the hook is
+// ever bypassed). Write-capable stays: no other tool is flagged, and the
+// before-hook still passes every non-background_run tool inside children.
+// The tools map is pass-through (hosts that do not understand it ignore the
+// key). Module-private constant (never exported — the manifest stays exactly
+// BackgroundOps+default). Never throws.
+// ---------------------------------------------------------------------------
+const CHILD_DENIED_TOOLS = { background_run: false } as const;
+// U6: pattern-aware deny parser for the before-hook. Exact-match
+// (input.tool === "background_run") missed namespaced/aliased variants a host
+// may surface (e.g. "BackgroundOps_background_run"). Deny when the tool name
+// CONTAINS the background_run token: among our 7 tools only background_run
+// matches (read/list/status/steer/stop/config never contain the token), so no
+// legitimate child tool call is newly denied. Non-string/empty names pass
+// (fail-open: the hook only ever denies provable background_run calls).
+// Total (never throws).
+function isBackgroundRunTool(name: unknown): boolean {
+  // Total by construction: typeof-narrowed string property reads cannot throw,
+  // so no try/catch is needed (a catch body would be an uncoverable line).
+  return typeof name === "string" && name.length > 0 && name.includes("background_run");
+}
 // L2: steers never extend the run past its original deadline.
 const MAX_STEERS = 5;
 // Phase-2 timeout policy: per-job default 24h (long jobs survive the night);
@@ -838,7 +866,9 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
         saveJob(job);
         writeHeartbeat(job, `task dispatched, session ${childID.slice(0, 8)} (try ${attempt}/${MAX_TRIES})`);
         const modelRef = toModelRef(job.model);
-        const promptResult: any = await c.session.promptAsync({ path: { id: childID }, body: { parts: toParts(job.prompt), ...(job.agent ? { agent: job.agent } : {}), ...(modelRef ? { model: modelRef } : {}) } }).catch((e: any) => ({ __bgError: e }));
+        // U6: declarative anti-recursion — the child turn is offered every
+        // tool EXCEPT background_run (hosts that ignore the key behave as before).
+        const promptResult: any = await c.session.promptAsync({ path: { id: childID }, body: { parts: toParts(job.prompt), ...(job.agent ? { agent: job.agent } : {}), ...(modelRef ? { model: modelRef } : {}), tools: { ...CHILD_DENIED_TOOLS } } }).catch((e: any) => ({ __bgError: e }));
         if (promptResult?.__bgError) throw new Error(`promptAsync failed: ${String(promptResult.__bgError?.message ?? promptResult.__bgError)}`);
         return;
       } catch (e: any) {
@@ -1704,7 +1734,11 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
   return {
     tool: { background_run, background_list, background_status, background_read, background_steer, background_stop, background_config },
     "tool.execute.before": async (input) => {
-      if (input.tool === "background_run" && childSessions.has(input.sessionID)) throw new Error("background_run is disabled inside background children — do the work directly with read/edit/bash.");
+      // U6: enforcing anti-recursion layer — pattern-aware deny (exact
+      // "background_run" AND namespaced/aliased variants); every other tool
+      // passes inside children (write-capable stays). Optional chaining keeps
+      // loader-shape invocations ({}/undefined) total.
+      if (childSessions.has(input?.sessionID) && isBackgroundRunTool(input?.tool)) throw new Error("background_run is disabled inside background children — do the work directly with read/edit/bash.");
     },
     event: async ({ event }: any) => {
       try {
@@ -1751,7 +1785,9 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
     },
     // S5/U5 rich compaction (THEIR running[] + unread[10] + read-hint shape):
     // running[] carries ALL live ids; unread is capped at the 10 oldest with a
-    // "+N more" overflow note; the trailing read-hint gives the retrieval verb.
+    // "+N more" overflow note; the trailing retrieval-hint bytes give BOTH
+    // verbs (background_read for full output, background_status for live
+    // progress) so a compacted parent knows which tool retrieves what.
     // Single push keeps the pre-S5 length-1 contract; empty stays silent (no
     // push). Best-effort, never throws.
     "experimental.session.compacting": async (_input, output) => {
@@ -1763,7 +1799,7 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
         const overflow = unread.length - shown.length;
         const runIds = running.map((j) => j.id).join(",");
         const unIds = shown.map((j) => `${j.id} [${j.state}]`).join(",");
-        output.context.push(`Background jobs: running=[${runIds}] unread=[${unIds}]${overflow > 0 ? ` (+${overflow} more)` : ""}. Retrieve full output via background_read(id).`);
+        output.context.push(`Background jobs: running=[${runIds}] unread=[${unIds}]${overflow > 0 ? ` (+${overflow} more)` : ""}. Retrieve full output via background_read(id); live progress via background_status.`);
       } catch { /* noop */ }
     },
   };
