@@ -685,3 +685,71 @@ New-code branches ALL covered except 1 defensive fallback, waived here:
   test/helpers.ts (BG_KEYS +1 env-hygiene) + docs/coverage-ratchet.md (this U2
   section), ALL uncommitted. No live writes, no repo logs/ (logs in
   /tmp/ocbg-logs/).
+
+## U3 — Opt-in blocking read (terminalWaiters + wait_ms?=0)
+
+Delta: src/plugin/background.ts — module-private U3 block (:~392-425:
+U3_MAX_WAIT_MS 300000 / U3_POLL_MS 100 / U3_TIMEOUT_GRACE_MS 10000 consts,
+terminalWaiters map, isTerminalState / parseU3WaitMs / effectiveU3WaitMs /
+fireTerminalWaiters; all module-private, zero new exports) + factory closure
+waitForU3Terminal (forced poll + waiter-signal race + finally cleanup) +
+background_read wait_ms schema + blocking branch (persisted-first fallback to
+[running]) + 4 one-line fireTerminalWaiters fan-ins (completeJobInternal,
+stopJobInternal, startTask dispatch-fail, queued-removal). Default instant
+preserved (wait_ms omitted/0/garbage/negative → 0 → old road byte-identical).
+
+- U3-D-01 waiter map: terminalWaiters Map<jobId, Set<mark>> module-level
+  (same lifetime as jobs/procs; fresh per resetModules import). Fired by the
+  uniform terminal funnel so natural + manual + reaper + dispatch-fail ALL
+  wake blocking readers. Fire is best-effort + total (never throws).
+- U3-D-02 wait budget: parseU3WaitMs (garbage/<=0 → 0, floor, 5m absolute
+  cap) + effectiveU3WaitMs (single-expression deadline+10s cap; legacy
+  no-deadline keeps the request). Waiter parks at most the effective budget.
+- U3-D-03 wait loop: forced refreshTaskJob/refreshBashJob poll (freshness
+  backstop bypassed — a blocking consumer is owed the poll) raced against
+  the waiter signal in 100ms slices; resolves on terminal, timeout, or
+  already-terminal early-return. finally removes the mark (empty set
+  deleted) — resolve/timeout/error leave no leak.
+- v8-ignore +0 lines / +0 regions: the deadline-cap fallthrough was
+  restructured to a single-expression ternary (no-deadline arm is
+  branch-only) so every new line executes — no defensive dead code added.
+
+## U3 — New tests (test/u3-blocking-read.test.ts, 8 its)
+
+Instant-default on running bash; 0/negative/garbage/NaN/undefined stay
+instant; blocking bash resolves terminal (fan-in wakes waiter, repeat read
+re-reads); 150ms budget on sleep-5 falls back [running] (waited ≥80ms, far
+below runtime); multi-waiter fanout (2 concurrent reads both terminal —
+covers set-exists arm); task-kind blocking resolves via forced poll;
+already-terminal + wait_ms returns immediately (early-return); huge wait_ms
+capped (5m absolute, terminal wins fast). No helpers.ts change (no env knob).
+
+## U3 — Branch/waiver accounting (BRDA taken from coverage/lcov.info)
+
+New-code lines ALL covered, zero new waivers: fire arms execute via the
+existing S0-U2 net (every terminal path already fires through the funnel);
+waiter create/exists arms via single/multi tests; timeout/terminal/poll
+arms via the fallback + bash + task tests. Uncovered funcs stay exactly the
+2 standing waivers (F-002 baseDir-throw funnel, F-012 setInterval tick).
+
+## U3 — Ticket impact
+
+- S4-COV-06/07/08/10(residual)/11/13/14 remain OPEN, untouched by U3 (no
+  production lines in their areas changed).
+- S4-COV-15 stays CLOSED. No new tickets. Waivers +0; standing waivers
+  (S4b-NEW-01/02/03, B-001–B-007, B-018/019, B-021, B-030, B-035,
+  B-042–B-048, B-064/065, B-068/069, B-090/091/097/098, B-103/104/105,
+  U1-W-01..04, U2-W-05, F-002, F-012) carried forward unchanged.
+
+## U3 re-proof (post-docs check-list for the pre-commit gate)
+
+- `npm test` → 269/269 green (23 files: 261 S0-U2 + 8 U3).
+- `npx vitest run --coverage` → Lines 100% (767/767); Branch 90.82%
+  (703/774); Funcs 98.60% (141/143, uncovered = standing F-002/F-012 only).
+- `tsc --noEmit` → exit 0. `scripts/loader-guard.sh` → green (probe-3
+  manifest-acceptance exact: BackgroundOps+default + 5 helpers, 7 tools).
+  `node --check` → all dist .js OK. `test/boot-contract.test.ts` solo → 5/5.
+- Change set: src/plugin/background.ts (U3 block + waiter + read branch +
+  4 fan-ins) + test/u3-blocking-read.test.ts (NEW, 8 its) +
+  docs/coverage-ratchet.md (this U3 section), ALL uncommitted. No live
+  writes, no repo logs/ (logs in /tmp/ocbg-logs/).
