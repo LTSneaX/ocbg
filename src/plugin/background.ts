@@ -78,6 +78,66 @@ interface Job { id: string; kind: Kind; state: State; prompt: string; agent?: st
 function cleanSingleLine(s: string): string {
   return s.replace(/[\r\n]+/g, " ").replace(/"/g, "").replace(/`/g, "").replace(/\s+/g, " ").trim().slice(0, 120);
 }
+// U1: optional LLM title/description enrichment (competitive-sweep upgrade U1,
+// kdco generateMetadata analogue). Post-terminal fire-and-forget temp session:
+// after a job reaches a terminal state the plugin asks a throwaway session to
+// summarise it as strict JSON {"title": string, "summary": string}, validates
+// + cleanSingleLine-fences the answer, and persists it over the truncation.
+// ANY failure (flag off, timeout, throw, unparseable) keeps the existing
+// truncation — enrichment never blocks or breaks the terminal path.
+// Default OFF (BG_U1_ENRICH=1 opts in): enrichment spends one model call per
+// terminal job, so it ships as an explicit opt-in. All helpers module-private
+// (never exported — the manifest stays exactly BackgroundOps+default).
+const U1_ENRICH_TIMEOUT_MS = 30_000;
+const U1_ENRICH_PROMPT_CAP = 2000;
+const U1_ENRICH_OUTPUT_CAP = 2000;
+function parseEnrichmentJson(raw: string): { title: string; summary: string } | null {
+  try {
+    const o = JSON.parse(raw) as unknown;
+    const t = (o as { title?: unknown } | null | undefined)?.title;
+    const s = (o as { summary?: unknown } | null | undefined)?.summary;
+    if (typeof t !== "string" || !t.trim()) return null;
+    if (typeof s !== "string" || !s.trim()) return null;
+    return { title: t, summary: s };
+  } catch {
+    return null; // not JSON → keep truncation
+  }
+}
+// Best-effort text extraction across session-API result shapes (promptAsync
+// payloads, {data} envelopes, parts arrays, messages listings). Returns null
+// when no text is provable — callers treat null as "keep truncation". Never
+// throws (a throwing shape resolves to null, never to a broken terminal path).
+function extractEnrichmentText(v: unknown): string | null {
+  try {
+    if (typeof v === "string") return v;
+    const d = (v as { data?: unknown } | null | undefined)?.data ?? v;
+    if (typeof d === "string") return d;
+    const rec = d as { text?: unknown; message?: unknown; parts?: unknown; messages?: unknown } | null | undefined;
+    const direct = rec?.text ?? rec?.message;
+    if (typeof direct === "string" && direct.trim()) return direct;
+    if (Array.isArray(rec?.parts)) {
+      const joined = (rec?.parts as unknown[]).filter((p) => (p as { type?: unknown })?.type === "text" && typeof (p as { text?: unknown })?.text === "string").map((p) => (p as { text: string }).text).join("\n");
+      if (joined.trim()) return joined;
+    }
+    if (Array.isArray(rec?.messages)) {
+      const texts: string[] = [];
+      for (const m of rec?.messages as unknown[]) {
+        const mp = (m as { parts?: unknown })?.parts ?? (m as { info?: { parts?: unknown } })?.info?.parts;
+        if (Array.isArray(mp)) {
+          for (const p of mp) {
+            const t = (p as { type?: unknown; text?: unknown })?.text;
+            if ((p as { type?: unknown })?.type === "text" && typeof t === "string" && t.trim()) texts.push(t);
+          }
+        }
+      }
+      const joined = texts.join("\n");
+      if (joined.trim()) return joined;
+    }
+    return null;
+  } catch {
+    return null; // throwing shape → keep truncation
+  }
+}
 // L2: steers never extend the run past its original deadline.
 const MAX_STEERS = 5;
 // Phase-2 timeout policy: per-job default 24h (long jobs survive the night);
@@ -779,6 +839,58 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
     // r7-turn-firing: stops turn-fire the parent (reply-mode wake, parent ACTS
     // on arrival — auto-read + report, unprompted). Placed after pumpQueue to avoid delaying slot release.
     await notifyJob(c, live, { wake: true });
+    // U1: enrichment is fire-and-forget — never awaited (the terminal path
+    // stays instant). The driver is total (never rejects), so bare void is
+    // safe here (same form as the :747 completeJobInternal call); failure
+    // keeps the truncation.
+    void enrichJobTitleSummary(live);
+  }
+  // ---------------------------------------------------------------------------
+  // U1: post-terminal enrichment driver (module-private closure, NOT exported).
+  // Fire-and-forget ONLY — callers use bare `void` and never await (the
+  // driver is total, so no floating rejection is possible). Reads the live BG_U1_ENRICH gate per call (default OFF) so the
+  // 233-test S0-S6 net never pays a model call unless opted in. Prompt and
+  // output are slice-capped; the 30s race (BG_U1_TIMEOUT_MS override, same
+  // parsePositiveMs discipline as every other knob) bounds the temp session.
+  // Any timeout/throw/parse-fail keeps the existing truncation. Never throws.
+  // ---------------------------------------------------------------------------
+  async function enrichJobTitleSummary(job: Job): Promise<void> {
+    try {
+      if (process.env.BG_U1_ENRICH !== "1") return; // default OFF: explicit opt-in per-job LLM cost
+      const live = jobs.get(job.id) ?? job;
+      /* v8 ignore next -- U1 defensive: callers fire only post-terminal; terminal states are final so running/queued here is impossible */
+      if (live.state === "running" || live.state === "queued") return;
+      const promptSlice = (live.prompt ?? "").slice(0, U1_ENRICH_PROMPT_CAP);
+      const outSlice = existsSync(live.outputPath) ? readFileSync(live.outputPath, "utf8").slice(-U1_ENRICH_OUTPUT_CAP) : (live.summary ?? "");
+      const prompt = `Summarise the finished background job below as STRICT JSON only, exactly {"title": "...", "summary": "..."} with no other text. Title: <=12 words, single line, no quotes/backticks/newlines. Summary: one line, <=40 words. Original task: """${promptSlice}""" Output tail: """${outSlice}"""`;
+      const run = (async (): Promise<void> => {
+        const created: any = await c?.session?.create?.({ body: { title: `bg-enrich:${live.id.slice(0, 8)}` } })?.catch(() => null);
+        const childID = (created as any)?.data?.id ?? (created as any)?.id;
+        if (!childID) return; // dispatch failed → keep truncation
+        const res: any = await c?.session?.promptAsync?.({ path: { id: childID }, body: { parts: toParts(prompt) } })?.catch(() => null);
+        let raw = extractEnrichmentText(res);
+        if (!raw) {
+          const msgs: any = await c?.session?.messages?.({ path: { id: childID } })?.catch(() => null);
+          raw = extractEnrichmentText(msgs);
+        }
+        if (!raw) return; // no provable text → keep truncation
+        const parsed = parseEnrichmentJson(raw);
+        if (!parsed) return; // unparseable → keep truncation
+        const cur = jobs.get(live.id) ?? live;
+        /* v8 ignore next -- U1 defensive: terminal states never transition back; the write below always wins in practice */
+        if (cur.state === "running" || cur.state === "queued") return;
+        cur.title = cleanSingleLine(parsed.title);
+        // Preserve the [DONE STATE] marker notifyJob prepended: swap only the
+        // tail after the first "::" separator, keep the marker prefix verbatim.
+        const m = /^\[DONE [A-Z]+\].*?::\s*/.exec(cur.summary);
+        cur.summary = m ? `${m[0]}${cleanSingleLine(parsed.summary)}` : cleanSingleLine(parsed.summary);
+        saveJob(cur);
+      })();
+      await withTimeout(run, parsePositiveMs(process.env.BG_U1_TIMEOUT_MS, U1_ENRICH_TIMEOUT_MS)).catch(() => null);
+    } catch {
+      /* v8 ignore next -- U1 defensive: every inner op is already guarded; the driver itself must be total */
+      return;
+    }
   }
   // ---------------------------------------------------------------------------
   // v2.2.0: terminal-state funnel (R6). completeJobInternal is the uniform
@@ -807,6 +919,9 @@ export const BackgroundOps: Plugin = async (input: any = {}) => {
       // timeout) turn-fire — parent ACTS on arrival (auto-read + report,
       // unprompted), no red stderr.
       await notifyJob(c, live, { wake: true });
+      // U1: same fire-and-forget enrichment as the stop path above — never
+      // awaited, driver-total so bare void is safe, failure keeps truncation.
+      void enrichJobTitleSummary(live);
     } catch (e: any) {
       /* v8 ignore next -- S3b: dead guard, funnel callees are total (persist/save/pump/notify all best-effort) */
       console.error(`[background-ops] completeJobInternal error on ${job?.id ?? "?"}: ${String(e?.message ?? e).slice(0, 200)}`);

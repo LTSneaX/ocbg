@@ -507,3 +507,99 @@ lines 632/632 = zero uncovered lines.
   (+2 Development bullets, 203→205 lines, same headings/order) +
   docs/coverage-ratchet.md (this S6 section), ALL uncommitted. No live
   writes, no repo logs/ (logs in /tmp/ocbg-logs/).
+
+## U1 — Production deltas (src/plugin/background.ts, post-terminal enrichment)
+
+U1 (competitive-sweep upgrade U1, kdco generateMetadata analogue): optional LLM
+title/description enrichment. After ANY terminal transition the plugin fires a
+throwaway temp session (session.create + promptAsync on a `bg-enrich:<id8>`
+child), asks for STRICT JSON {"title","summary"}, validates +
+cleanSingleLine-fences the answer, and persists it over the truncation —
+preserving the [DONE STATE] marker prefix notifyJob prepended (tail after the
+first "::" is swapped, marker kept verbatim; marker-absent quiet jobs take the
+bare-enrichment arm). Prompt slice-capped (U1_ENRICH_PROMPT_CAP=2000) + output
+tail-capped (U1_ENRICH_OUTPUT_CAP=2000); whole attempt raced at 30s
+(U1_ENRICH_TIMEOUT_MS, BG_U1_TIMEOUT_MS override via parsePositiveMs, same
+discipline as every other knob). Default OFF (BG_U1_ENRICH=1 opts in):
+enrichment spends one model call per terminal job, so it ships explicit
+opt-in — and the 233-test S0-S6 net never pays session traffic unless opted
+in (zero existing-test churn: no count assertion disturbed).
+
+- U1-D-01 module helpers (:~81-140): U1_ENRICH_* constants +
+  parseEnrichmentJson (JSON.parse + title/summary string+non-blank validation,
+  null on any failure) + extractEnrichmentText (best-effort text across
+  string / {data} / direct text|message / parts[] / messages[] shapes, null
+  when no text provable, total — throwing shapes resolve to null). Pure,
+  module-private, zero exports (manifest unchanged).
+- U1-D-02 driver enrichJobTitleSummary (:~855-892): live BG_U1_ENRICH gate per
+  call, slice-capped prompt build, temp-session attempt under withTimeout,
+  messages-fallback when promptAsync yields no text, DONE-marker-preserving
+  write + saveJob. Fire-and-forget ONLY (callers bare `void`, never await —
+  the driver is total so no floating rejection is possible, same form as the
+  :747 completeJobInternal call); total (outer try/catch + every inner op
+  guarded, session-API rejections swallowed per-call-site via .catch).
+- U1-D-03 call sites (2 lines): stopJobInternal + completeJobInternal, each
+  `void enrichJobTitleSummary(live)` AFTER the awaited notifyJob — terminal
+  path stays instant, slot release (pumpQueue) unaffected.
+- v8-ignore +3 lines / +3 regions (U1-W-05/06/07): pre-write running/queued
+  guard, post-parse running/queued guard, outer-catch return — all defensive
+  (terminal states are final; every inner op is already guarded).
+
+## U1 — New tests (test/u1-enrichment.test.ts, 21 its)
+
+PromptAsync mock splits the parent wake-note road (path.id === OWNER → {}) from
+the enrichment temp-session road (any other id → scripted payload); without
+this split a hanging enrichment mock would also hang the awaited wake-note.
+Success matrix (string / parts[] / data-string / messages-direct-text /
+messages-array / info.parts / promptAsync-reject-then-messages-fallback),
+DONE-marker preservation + hostile-byte fencing (quotes/backticks/newlines
+stripped, ≤120), quiet-job bare arm, stop-path enrichment. Failure matrix
+(create-fail, create-reject, unparseable, empty shapes, throwing getter shape,
+messages-reject, blank-title, blank-summary, blank-parts, non-text part,
+missing-parts, 80ms timeout race) — every fallback one asserts create-traffic
+happened AND the truncation title survived. Never-blocks (hanging enrich + 5s
+race, terminal lands <3s). Disabled-by-default pin (no create traffic,
+truncation kept).
+
+## U1 — Branch/waiver accounting (BRDA taken=0 from coverage/lcov.info)
+
+New-code branches ALL covered except 6 defensive fallbacks, waived here
+(unreachable via the public surface — same class as standing S4b waivers):
+
+- U1-W-01 :860 `jobs.get(job.id) ?? job` fallback — enrich fires only with a
+  live in-map job; eviction mid-tick is impossible in tests (retention rides
+  the 60s sweep). WAIVER.
+- U1-W-02 :863 `(live.prompt ?? "")` fallback — prompt is always set by
+  makeJob. WAIVER.
+- U1-W-03 :864 existsSync-false + `(live.summary ?? "")` arms — output file is
+  always persisted before the terminal transition; the prefix runs
+  synchronously in the notify tick so no interleaving can remove it. WAIVER.
+- U1-W-04 :879 `jobs.get(live.id) ?? live` fallback — same in-map invariant as
+  U1-W-01. WAIVER.
+- Covered (no waiver): :884 marker-absent arm (quiet-job test), :120
+  blank-parts arm, :125 info.parts arm, :126/:129/:134 non-text/missing-parts
+  arms, parse title/summary/throw arms, create-fail/timeout/empty arms.
+
+## U1 — Ticket impact
+
+- S4-COV-06/07/08/10(residual)/11/13/14 remain OPEN, untouched by U1 (no
+  production lines in their areas changed).
+- S4-COV-15 stays CLOSED. No new tickets. Waivers +4 (U1-W-01..04) and
+  v8-ignore +3 lines / +3 regions (U1-W-05/06/07); all other standing waivers
+  carried forward unchanged.
+
+## U1 re-proof (post-docs check-list for the pre-commit gate)
+
+- `npm test` → 254/254 green (21 files: 233 S0-S6 + 21 U1).
+- `npx vitest run --coverage` → Lines 100% (691/691); Branch 91.51%
+  (647/707, +57 taken vs S6; 6 new untaken = U1-W-01..04 above); Funcs 98.44%
+  (127/129, uncovered = standing F-002/F-012 only — the 5 transient U1
+  catch-arrow functions were eliminated by design (bare-void call sites) or
+  covered (session-rejection tests)).
+- `tsc --noEmit` → exit 0. `scripts/loader-guard.sh` → green (probe-3
+  manifest-acceptance exact: BackgroundOps+default + 5 helpers, 7 tools).
+  `node --check` → all dist .js OK. `test/boot-contract.test.ts` solo → 5/5.
+- Change set: src/plugin/background.ts (U1 helpers + driver + 2 call sites) +
+  test/u1-enrichment.test.ts (NEW, 18 its) + docs/coverage-ratchet.md (this U1
+  section), ALL uncommitted. No live writes, no repo logs/ (logs in
+  /tmp/ocbg-logs/).
