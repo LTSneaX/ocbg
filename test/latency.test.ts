@@ -1,11 +1,12 @@
 // Slice 2 — F1 bash persistence debounce + F2/A3 parallel list/status refresh.
-// F1: trailing-edge coalescing (unit: deterministic fake timers) + flush-on-close
-//     with zero data loss under chunk storms and multi-window drips (integration).
+// r8 strip: the trailing-debouncer unit describes are gone (helper is
+// module-private) — F1 is proven behaviorally end-to-end below (chunk storm
+// + multi-window drip with zero loss through the public tool surface).
 // F2/A3: pre-render refresh is concurrent (Promise.allSettled) + per-job timeout +
 //     fresh-heartbeat skip; suites lock ordering, staleness behavior, and failure
-//     isolation. All via the public tool surface (+ pure helper imports for F1).
+//     isolation. All via the public tool surface.
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import {
@@ -23,7 +24,6 @@ import {
   waitTerminal,
   completedMessages,
 } from "./helpers.js";
-import { createTrailingDebouncer } from "../src/plugin/background.js";
 
 saveEnv();
 
@@ -32,103 +32,6 @@ const OWNER = "owner-A";
 function heartbeatFile(home: string, dir: string, id: string): string {
   return join(projectDir(home, dir), `${id}.heartbeat`);
 }
-
-describe("F1 trailing debouncer (unit)", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("coalescing holds at every point of the 250-500ms review band", () => {
-    // The production persist window lives inside this band (review contract);
-    // the integration tests below exercise the actual production value
-    // end-to-end (chunk storm + multi-window drip with zero loss).
-    for (const windowMs of [250, 300, 500]) {
-      let writes = 0;
-      const d = createTrailingDebouncer(windowMs, () => {
-        writes++;
-      });
-      for (let i = 0; i < 10; i++) d.schedule();
-      expect(writes).toBe(0); // nothing fires synchronously
-      vi.advanceTimersByTime(windowMs - 1);
-      expect(writes).toBe(0); // still inside the window
-      vi.advanceTimersByTime(1);
-      expect(writes).toBe(1); // exactly one trailing write
-    }
-  });
-
-  it("rapid schedules coalesce into a single trailing write", () => {
-    let writes = 0;
-    const d = createTrailingDebouncer(300, () => {
-      writes++;
-    });
-    for (let i = 0; i < 100; i++) d.schedule();
-    expect(writes).toBe(0); // nothing fires synchronously
-    vi.advanceTimersByTime(299);
-    expect(writes).toBe(0); // still inside the window
-    vi.advanceTimersByTime(1);
-    expect(writes).toBe(1); // exactly one trailing write
-  });
-
-  it("a second burst after the window fires a second write", () => {
-    let writes = 0;
-    const d = createTrailingDebouncer(300, () => {
-      writes++;
-    });
-    d.schedule();
-    vi.advanceTimersByTime(300);
-    expect(writes).toBe(1);
-    d.schedule();
-    d.schedule();
-    vi.advanceTimersByTime(300);
-    expect(writes).toBe(2);
-  });
-
-  it("flush runs the pending write immediately", () => {
-    let writes = 0;
-    const d = createTrailingDebouncer(300, () => {
-      writes++;
-    });
-    d.schedule();
-    d.flush();
-    expect(writes).toBe(1);
-    vi.advanceTimersByTime(1000);
-    expect(writes).toBe(1); // no double-fire from the cancelled timer
-  });
-
-  it("cancel drops the pending write", () => {
-    let writes = 0;
-    const d = createTrailingDebouncer(300, () => {
-      writes++;
-    });
-    d.schedule();
-    d.cancel();
-    vi.advanceTimersByTime(1000);
-    expect(writes).toBe(0);
-  });
-
-  it("10k-chunk storm: every byte lands, ordered, in one trailing write", () => {
-    const chunks: string[] = ["$ seq-storm\n"];
-    const bodies: string[] = [];
-    const d = createTrailingDebouncer(300, () => {
-      bodies.push(chunks.join(""));
-    });
-    for (let i = 1; i <= 10000; i++) {
-      chunks.push(`line-${i}\n`);
-      d.schedule();
-    }
-    vi.advanceTimersByTime(300);
-    expect(bodies).toHaveLength(1);
-    const body = bodies[0];
-    expect(body).toContain("line-1\n");
-    expect(body).toContain("line-10000\n");
-    expect(body.indexOf("line-1\n")).toBeLessThan(body.indexOf("line-5000\n"));
-    expect(body.indexOf("line-5000\n")).toBeLessThan(body.indexOf("line-10000\n"));
-    expect(body.split("\n").filter(Boolean)).toHaveLength(10001); // header + 10k lines
-  });
-});
 
 describe("F1 bash debounce (integration)", () => {
   let home: string;

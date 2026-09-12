@@ -9,9 +9,9 @@
 // Contract (5 clauses):
 //  1. dist import resolves (plain dynamic import; no mocks in the import path)
 //  2. exact manifest: plugin entries are EXACTLY {BackgroundOps, default}
-//     (both functions); helper exports are an exact allowlist — every export
-//     a function, so the loader tripwire "Plugin export is not a function"
-//     can never fire on these bytes
+//     (both functions, default IS BackgroundOps). NOTHING else is exported —
+//     the r8 strip made every helper module-private, so the loader tripwire
+//     "Plugin export is not a function" can never fire on these bytes
 //  3. minimal realistic client resolves to the 7-tool surface AND runs a real
 //     bash job to terminal (REAL child process through dist code, not mock-only)
 //  4. hook smoke: tool.execute.before / event / transform / compacting never
@@ -42,14 +42,9 @@ saveEnv();
 const DIST_SPEC = "../dist/src/plugin/background.js";
 
 const PLUGIN_ENTRIES = ["BackgroundOps", "default"];
-const HELPER_ALLOWLIST = [
-  "__clearListCache",
-  "__getDiskScanCount",
-  "createTrailingDebouncer",
-  "pruneOldJobs",
-  "runBoundedPool",
-];
-const FULL_ALLOWLIST = [...PLUGIN_ENTRIES, ...HELPER_ALLOWLIST].sort();
+// r8 strip: zero helper exports — every helper is module-private. The
+// allowlist is exactly the two plugin entries (1+default identity).
+const FULL_ALLOWLIST = [...PLUGIN_ENTRIES].sort();
 
 const SEVEN = [
   "background_run",
@@ -83,7 +78,7 @@ describe("S0 boot-contract (dist bytes, loader path)", () => {
     expect(typeof mod, "dist import must be an object namespace").toBe("object");
   });
 
-  it("clause 2: exact manifest — {BackgroundOps, default} + helper allowlist, all functions", async () => {
+  it("clause 2: exact manifest — {BackgroundOps, default} only, both functions, 1+default identity", async () => {
     const mod: any = await import(/* @vite-ignore */ DIST_SPEC);
     const keys = Object.keys(mod).sort();
     expect(keys, `export surface must be exactly [${FULL_ALLOWLIST.join(", ")}]`).toEqual(FULL_ALLOWLIST);
@@ -134,7 +129,7 @@ describe("S0 boot-contract (dist bytes, loader path)", () => {
     await expect(
       plugin["experimental.chat.system.transform"]({}, sys),
     ).resolves.toBeUndefined();
-    expect(sys.system.join("")).toContain("BACKGROUND OPS");
+    expect(sys.system.join("")).toContain("OCBG");
 
     // experimental.session.compacting: surfaces context without throwing.
     const out: any = { context: [] };
@@ -165,8 +160,8 @@ describe("S0 boot-contract (dist bytes, loader path)", () => {
       // Both instances serve: config resolves the same version on each.
       const v1 = String(await first.tool.background_config.execute({}, makeCtx("o", makeWorkdir())));
       const v2 = String(await second.tool.background_config.execute({}, makeCtx("o", makeWorkdir())));
-      expect(v1).toContain("background-ops v");
-      expect(v2).toContain("background-ops v");
+      expect(v1).toContain("OCBG v");
+      expect(v2).toContain("OCBG v");
       expect(sweepArms, `hot-reload must not double-arm the sweep (saw ${sweepArms} new 60s arms)`).toBeLessThanOrEqual(1);
     } finally {
       spy.mockRestore();

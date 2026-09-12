@@ -109,7 +109,7 @@ describe("S3b host-scream fallbacks", () => {
       const out = String(
         await plugin.tool.background_config.execute({}, makeCtx(OWNER, dir)),
       );
-      expect(out).toContain("background-ops v");
+      expect(out).toContain("OCBG v");
     } finally {
       setHashThrow(false);
     }

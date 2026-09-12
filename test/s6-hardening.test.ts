@@ -133,7 +133,7 @@ describe("S6 hardening", () => {
     expect(wakes.length).toBeGreaterThan(0);
     const text = String(wakes[0]?.[0]?.body?.parts?.[0]?.text ?? "");
     expect(text).toContain("Untrusted child output");
-    const block = text.split("Untrusted child output")[1].split("Full output")[0];
+    const block = text.split("Untrusted child output")[1].split("Output (untrusted)")[0];
     // The trusted """ delimiters frame the block; the INNER untrusted content
     // must carry no fence-breaking bytes of its own.
     const inner = block.split('"""')[1] ?? "";

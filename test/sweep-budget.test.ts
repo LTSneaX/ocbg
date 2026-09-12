@@ -1,10 +1,12 @@
 // Phase 2 Slice 4 FINAL — F5 sweep budget + F6 polish guards.
 //
-// F5: runBoundedPool unit (concurrency cap, budget-expiry defers, error
-// isolation) + constants bands + sweep integration (pool preserves reap
-// semantics; overlapping ticks skip via the reentrancy guard, never double).
-// F6: heartbeat coalesce (F6.1), refresh no-refetch backstop (F6.2),
-// read-without-rewrite (F6.3), single-timer double-boot (F6.5).
+// r8 strip: the runBoundedPool unit describes are gone (helper is
+// module-private — pool semantics are proven behaviorally by the sweep
+// integration below through the public tool surface). Kept: sweep
+// integration (pool preserves reap semantics; overlapping ticks skip via
+// the reentrancy guard, never double) + F6 polish guards: heartbeat
+// coalesce (F6.1), refresh no-refetch backstop (F6.2), read-without-rewrite
+// (F6.3), single-timer double-boot (F6.5).
 // F6.4/F6.6 are comment-only (accepted-noise / certified-minimal) — covered by
 // the unchanged existing suites staying green.
 
@@ -26,7 +28,6 @@ import {
   completedMessages,
   staleActivity,
 } from "./helpers.js";
-import { runBoundedPool } from "../src/plugin/background.js";
 
 saveEnv();
 
@@ -46,81 +47,6 @@ function writeStaleHeartbeat(home: string, dir: string, id: string): void {
 }
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-describe("F5 runBoundedPool (unit, real timers)", () => {
-  it("caps concurrency at the limit and completes every item", async () => {
-    let active = 0;
-    let maxActive = 0;
-    const seen: string[] = [];
-    const items = ["a", "b", "c", "d", "e", "f"];
-    const res = await runBoundedPool(items, 3, 60_000, async (item) => {
-      active++;
-      maxActive = Math.max(maxActive, active);
-      await delay(30);
-      seen.push(item);
-      active--;
-    });
-    expect(res).toEqual({ completed: 6, skipped: 0 });
-    expect(seen.sort()).toEqual(["a", "b", "c", "d", "e", "f"]);
-    expect(maxActive).toBe(3); // pool of 3: all three workers launch together
-  });
-
-  it("budget expiry defers not-yet-started jobs (never runs them)", async () => {
-    const started: string[] = [];
-    const res = await runBoundedPool(["k0", "k1", "k2", "k3"], 1, 30, async (item) => {
-      started.push(item);
-      await delay(80);
-    });
-    // k0 runs its full 80ms (a started job always runs to its own decision);
-    // by the time it finishes the 30ms budget has expired, so k1-k3 defer.
-    expect(started).toEqual(["k0"]);
-    expect(res).toEqual({ completed: 1, skipped: 3 });
-  });
-
-  it("per-item errors never stop the pool and never throw outward", async () => {
-    const seen: string[] = [];
-    const res = await runBoundedPool(["a", "b", "c", "d"], 2, 60_000, async (item) => {
-      seen.push(item);
-      if (item === "b") throw new Error("boom");
-    });
-    expect(seen.sort()).toEqual(["a", "b", "c", "d"]);
-    expect(res).toEqual({ completed: 4, skipped: 0 });
-  });
-
-  it("empty input resolves immediately with zero work", async () => {
-    let calls = 0;
-    const res = await runBoundedPool<string>([], 3, 20_000, async () => {
-      calls++;
-    });
-    expect(res).toEqual({ completed: 0, skipped: 0 });
-    expect(calls).toBe(0);
-  });
-});
-
-describe("F5 sweep defaults (behavioral bands)", () => {
-  it("production-shaped pool drains fully with zero deferral", async () => {
-    // Production sweep runs a width-3 pool over a 20s budget; fast items must
-    // all complete with nothing deferred. The true defaults are pinned
-    // end-to-end below (reentrancy raises BG_SWEEP_BUDGET_MS and sees no
-    // expiry; budget-expiry keeps the default and sees the deferral log).
-    const res = await runBoundedPool(["a", "b", "c", "d", "e", "f"], 3, 20_000, async () => {
-      await delay(5);
-    });
-    expect(res).toEqual({ completed: 6, skipped: 0 });
-  });
-
-  it("an already-exhausted budget defers everything without running one item", async () => {
-    // Budget is checked BETWEEN jobs only: with a zero budget no worker ever
-    // starts, so nothing runs and everything defers. Fully deterministic —
-    // no timing dependence (complements the 30ms/80ms expiry unit above).
-    let calls = 0;
-    const res = await runBoundedPool(["a", "b"], 3, 0, async () => {
-      calls++;
-    });
-    expect(calls).toBe(0);
-    expect(res).toEqual({ completed: 0, skipped: 2 });
-  });
-});
 
 describe("F5 sweep integration (fake timers)", () => {
   let home: string;

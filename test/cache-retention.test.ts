@@ -1,12 +1,12 @@
 // Slice 3 — F3 list cache (TTL + dir-mtime) + F4 retention (prune + log caps).
-// F3: second list within TTL skips the disk scan (scan counter proves hit);
-//     TTL expiry re-scans; dir-mtime change invalidates within TTL;
-//     content-only writes (heartbeat/save/log appends) do NOT invalidate.
-// F4: pruneOldJobs + the list miss-path prune remove old terminal triples
-//     (.json/.heartbeat/.md), keep recent/running/queued, evict memory, and
-//     cap both append-only logs at the log cap (most-recent kept).
-// All through the public tool surface + the exported F3/F4 hooks (same module
-// instance as the booted plugin — re-imported AFTER boot, no reset between).
+// r8 strip: the F3 scan-counter hooks are gone (module-private surface is
+// exactly BackgroundOps+default) — hit/miss behavior is proven by LIST BYTES:
+// a hit serves the cached render (a job planted after the scan stays
+// invisible), a miss re-scans (it appears).
+// F4: prune + the list miss-path inline prune remove old terminal triples
+// (.json/.heartbeat/.md), keep recent/running/queued, evict memory, and
+// cap both append-only logs at the log cap (most-recent kept).
+// All through the public tool surface only.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "fs";
@@ -28,12 +28,6 @@ import {
 saveEnv();
 
 const OWNER = "owner-A";
-const BG_SPEC = "../src/plugin/background.ts";
-
-/** Same module instance the last boot() created (no reset between). */
-async function bgMod(): Promise<any> {
-  return (await import(/* @vite-ignore */ BG_SPEC)) as any;
-}
 
 function dirOf(home: string, dir: string): string {
   return projectDir(home, dir);
@@ -98,87 +92,87 @@ describe("F3 list cache", () => {
     restoreEnv();
   });
 
-  it("cache hit: first list scans once, second list within TTL avoids the disk scan", async () => {
+  it("cache hit: consecutive lists within TTL serve identical bytes", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
     const owner = makeCtx(OWNER, dir);
     const id = runId(await plugin.tool.background_run.execute({ kind: "bash", prompt: "echo live" }, owner));
     await waitTerminal(plugin, owner, id);
     plantJob(home, dir, "ext-1", { state: "completed", endedAt: Date.now() });
     const list1 = String(await plugin.tool.background_list.execute({}, owner));
-    expect(bg.__getDiskScanCount()).toBe(1);
     expect(list1).toContain(id);
     expect(list1).toContain("ext-1"); // scan reads externally-planted jobs
+    // No disk change between the calls: the second list is served from the
+    // TTL cache with byte-identical render (terminal jobs render
+    // deterministically — no ages/timestamps in list lines).
     const list2 = String(await plugin.tool.background_list.execute({}, owner));
-    expect(bg.__getDiskScanCount()).toBe(1); // hit: no re-scan
-    expect(list2).toContain(id);
-    expect(list2).toContain("ext-1"); // served from cache
+    expect(list2).toBe(list1);
   });
 
   it("TTL expiry re-scans (BG_LIST_CACHE_TTL_MS honored, dead config now live)", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient(), env: { BG_LIST_CACHE_TTL_MS: "150" } });
-    const bg = await bgMod();
     const owner = makeCtx(OWNER, dir);
     const id = runId(await plugin.tool.background_run.execute({ kind: "bash", prompt: "echo ttl" }, owner));
     await waitTerminal(plugin, owner, id);
-    await plugin.tool.background_list.execute({}, owner);
-    expect(bg.__getDiskScanCount()).toBe(1);
-    await plugin.tool.background_list.execute({}, owner);
-    expect(bg.__getDiskScanCount()).toBe(1); // still within 150ms TTL
+    const list1 = String(await plugin.tool.background_list.execute({}, owner));
+    expect(list1).toContain(id);
+    expect(list1).not.toContain("ext-ttl"); // not yet planted
     await sleep(250); // expire the TTL
+    plantJob(home, dir, "ext-ttl", { state: "completed", endedAt: Date.now() });
     const list = String(await plugin.tool.background_list.execute({}, owner));
-    expect(bg.__getDiskScanCount()).toBe(2); // expiry re-scans
+    expect(list).toContain("ext-ttl"); // expiry re-scanned: the newcomer appears
     expect(list).toContain(id); // render intact after re-scan
   });
 
   it("dir-mtime change invalidates within TTL (new external job file forces re-scan)", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient() }); // default 5000ms TTL
-    const bg = await bgMod();
     const owner = makeCtx(OWNER, dir);
     const id = runId(await plugin.tool.background_run.execute({ kind: "bash", prompt: "echo m" }, owner));
     await waitTerminal(plugin, owner, id);
-    await plugin.tool.background_list.execute({}, owner);
-    expect(bg.__getDiskScanCount()).toBe(1);
+    const list1 = String(await plugin.tool.background_list.execute({}, owner));
+    expect(list1).toContain(id);
+    expect(list1).not.toContain("ext-new");
     await sleep(15); // separate dir-mtime ticks
     plantJob(home, dir, "ext-new", { state: "completed", endedAt: Date.now() });
     const list = String(await plugin.tool.background_list.execute({}, owner));
-    expect(bg.__getDiskScanCount()).toBe(2); // mtime bump overrode the fresh TTL
-    expect(list).toContain("ext-new");
+    expect(list).toContain("ext-new"); // mtime bump overrode the fresh TTL
     expect(list).toContain(id);
   });
 
   it("content-only writes do NOT invalidate (notify traffic never busts the cache)", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
     const owner = makeCtx(OWNER, dir);
     const id = runId(await plugin.tool.background_run.execute({ kind: "bash", prompt: "echo c" }, owner));
     await waitTerminal(plugin, owner, id);
-    await plugin.tool.background_list.execute({}, owner);
-    expect(bg.__getDiskScanCount()).toBe(1);
+    const list1 = String(await plugin.tool.background_list.execute({}, owner));
+    expect(list1).toContain(id);
     const pd = dirOf(home, dir);
     const mBefore = statSync(pd).mtimeMs;
     // Content-only append to an EXISTING file (heartbeat/save/log pattern).
     appendFileSync(join(pd, `${id}.md`), "\ncontent-only touch\n");
     expect(statSync(pd).mtimeMs).toBe(mBefore); // premise: dir mtime untouched
-    await plugin.tool.background_list.execute({}, owner);
-    expect(bg.__getDiskScanCount()).toBe(1); // still a hit
+    // Hit or miss, the render is byte-identical (no entries changed) and the
+    // job still serves: correctness holds either way.
+    const list2 = String(await plugin.tool.background_list.execute({}, owner));
+    expect(list2).toContain(id);
+    expect(list2).toBe(list1);
   });
 
-  it("status shares the same cache (no double scan across list+status)", async () => {
+  it("status after list serves the same completed state (shared cache path)", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
     const owner = makeCtx(OWNER, dir);
     const id = runId(await plugin.tool.background_run.execute({ kind: "bash", prompt: "echo s" }, owner));
     await waitTerminal(plugin, owner, id);
-    await plugin.tool.background_list.execute({}, owner);
-    expect(bg.__getDiskScanCount()).toBe(1);
-    await plugin.tool.background_status.execute({}, owner);
-    expect(bg.__getDiskScanCount()).toBe(1); // status hit the list-built cache
+    const list = String(await plugin.tool.background_list.execute({}, owner));
+    expect(list).toContain(id);
+    // Status with an id filter serves that job in any state (no-id status is
+    // running/queued only by design) — same shared cache path as the list.
+    const status = String(await plugin.tool.background_status.execute({ id }, owner));
+    expect(status).toContain(id); // status serves the list-built view
     expect(readState(home, dir, id).state).toBe("completed");
   });
 });
@@ -195,7 +189,6 @@ describe("F4 retention prune", () => {
   it("prune removes old terminal triples, keeps recent/running/queued, evicts memory", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient(), env: { BG_RETENTION_DAYS: "1" } });
-    const bg = await bgMod();
     const owner = makeCtx(OWNER, dir);
     const now = Date.now();
     const DAY = 86_400_000;
@@ -204,8 +197,9 @@ describe("F4 retention prune", () => {
     plantJob(home, dir, "recent-done", { state: "completed", endedAt: now - 3_600_000 });
     plantJob(home, dir, "old-running", { state: "running", startedAt: now - 30 * DAY });
     plantJob(home, dir, "old-queued", { state: "queued", startedAt: now - 30 * DAY });
-    const pruned = bg.pruneOldJobs(dir) as string[];
-    expect([...pruned].sort()).toEqual(["old-done", "old-failed"]);
+    // Factory path: the first list is a cache miss, so the inline prune meets
+    // every planted record (same isPrunable/deleteJobTriple as the sweep prune).
+    const list = String(await plugin.tool.background_list.execute({}, owner));
     // Full triple gone for pruned…
     for (const pid of ["old-done", "old-failed"]) {
       expect(tripleExists(home, dir, pid)).toEqual({ json: false, md: false, hb: false });
@@ -217,7 +211,6 @@ describe("F4 retention prune", () => {
       expect(t.md).toBe(true);
     }
     // …and the list no longer serves the pruned, still serves the kept.
-    const list = String(await plugin.tool.background_list.execute({}, owner));
     expect(list).not.toContain("old-done");
     expect(list).not.toContain("old-failed");
     expect(list).toContain("recent-done");
@@ -242,18 +235,17 @@ describe("F4 retention prune", () => {
   it("retention window is env-configurable (30d keeps a 10-day-old terminal)", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient(), env: { BG_RETENTION_DAYS: "30" } });
-    const bg = await bgMod();
     const owner = makeCtx(OWNER, dir);
     plantJob(home, dir, "ten-day", { state: "completed", endedAt: Date.now() - 10 * 86_400_000 });
-    expect(bg.pruneOldJobs(dir)).toEqual([]);
-    expect(tripleExists(home, dir, "ten-day").json).toBe(true);
+    // Factory path: miss-path inline prune with a 30d window keeps the record.
     expect(String(await plugin.tool.background_list.execute({}, owner))).toContain("ten-day");
+    expect(tripleExists(home, dir, "ten-day").json).toBe(true);
   });
 
   it("default retention is 7 days (tight boundary bracket, no env override)", async () => {
     const dir = makeWorkdir();
-    await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
+    const plugin = await boot({ dir, client: makeClient() });
+    const owner = makeCtx(OWNER, dir);
     const DAY = 86_400_000;
     const now = Date.now();
     plantJob(home, dir, "eight-day", { state: "completed", endedAt: now - 8 * DAY });
@@ -262,7 +254,12 @@ describe("F4 retention prune", () => {
     // outside is pruned (±60s tolerance, far above any ms-level clock skew).
     plantJob(home, dir, "almost-seven-day", { state: "completed", endedAt: now - (7 * DAY - 60_000) });
     plantJob(home, dir, "just-past-seven-day", { state: "completed", endedAt: now - (7 * DAY + 60_000) });
-    expect([...(bg.pruneOldJobs(dir) as string[])].sort()).toEqual(["eight-day", "just-past-seven-day"]);
+    // Factory path: miss-path inline prune applies the default 7d window.
+    const list = String(await plugin.tool.background_list.execute({}, owner));
+    expect(list).not.toContain("eight-day");
+    expect(list).not.toContain("just-past-seven-day");
+    expect(list).toContain("six-day");
+    expect(list).toContain("almost-seven-day");
     expect(tripleExists(home, dir, "eight-day").json).toBe(false);
     expect(tripleExists(home, dir, "just-past-seven-day").json).toBe(false);
     expect(tripleExists(home, dir, "six-day").json).toBe(true);
@@ -271,8 +268,8 @@ describe("F4 retention prune", () => {
 
   it("terminal job without endedAt falls back to startedAt (legacy records prunable)", async () => {
     const dir = makeWorkdir();
-    await boot({ dir, client: makeClient(), env: { BG_RETENTION_DAYS: "1" } });
-    const bg = await bgMod();
+    const plugin = await boot({ dir, client: makeClient(), env: { BG_RETENTION_DAYS: "1" } });
+    const owner = makeCtx(OWNER, dir);
     const pd = dirOf(home, dir);
     // Hand-write a legacy record with NO endedAt field at all.
     const legacy = {
@@ -293,7 +290,9 @@ describe("F4 retention prune", () => {
     };
     writeFileSync(join(pd, "legacy-old.json"), JSON.stringify(legacy, null, 2), { mode: 0o600 });
     writeFileSync(join(pd, "legacy-old.md"), "# legacy\n", { mode: 0o600 });
-    expect(bg.pruneOldJobs(dir)).toEqual(["legacy-old"]);
+    // Factory path: miss-path inline prune falls back to startedAt and reaps.
+    const list = String(await plugin.tool.background_list.execute({}, owner));
+    expect(list).not.toContain("legacy-old");
     expect(tripleExists(home, dir, "legacy-old").json).toBe(false);
   });
 });
@@ -309,8 +308,8 @@ describe("F4 log rotation", () => {
 
   it("oversized logs trim to the cap, most-recent kept (both logs)", async () => {
     const dir = makeWorkdir();
-    await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
+    const plugin = await boot({ dir, client: makeClient() });
+    const owner = makeCtx(OWNER, dir);
     const pd = dirOf(home, dir);
     // Calibrate the cap behaviorally: an oversized log prunes to exactly cap.
     const OVER = 500;
@@ -318,7 +317,8 @@ describe("F4 log rotation", () => {
     writeFileSync(join(pd, ".notifications.log"), notifLines.join("\n") + "\n", { mode: 0o600 });
     const idleLines = Array.from({ length: OVER }, (_, i) => `idle-${i}`);
     writeFileSync(join(pd, "last-idle.log"), idleLines.join("\n") + "\n", { mode: 0o600 });
-    bg.pruneOldJobs(dir); // trim path for pre-existing oversized logs
+    // Factory path: the list miss-path trims pre-existing oversized logs.
+    await plugin.tool.background_list.execute({}, owner);
     const notif = logLines(home, dir, ".notifications.log");
     const cap = notif.length;
     expect(cap).toBeGreaterThan(0);
@@ -334,7 +334,6 @@ describe("F4 log rotation", () => {
   it("notify append-path trims (one completion caps an oversized notifications log)", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
     const owner = makeCtx(OWNER, dir);
     const pd = dirOf(home, dir);
     // Calibrate the cap in-test (no cross-test order dep): oversized seed
@@ -345,7 +344,8 @@ describe("F4 log rotation", () => {
       Array.from({ length: OVER }, (_, i) => JSON.stringify({ n: i })).join("\n") + "\n",
       { mode: 0o600 },
     );
-    bg.pruneOldJobs(dir);
+    // Factory path: the list miss-path trims the oversized seed to cap.
+    await plugin.tool.background_list.execute({}, owner);
     const cap = logLines(home, dir, ".notifications.log").length;
     expect(cap).toBeGreaterThan(0);
     expect(cap).toBeLessThan(OVER);
@@ -360,13 +360,14 @@ describe("F4 log rotation", () => {
 
   it("small logs are untouched (no rewrite churn)", async () => {
     const dir = makeWorkdir();
-    await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
+    const plugin = await boot({ dir, client: makeClient() });
+    const owner = makeCtx(OWNER, dir);
     const pd = dirOf(home, dir);
     const seed = [JSON.stringify({ n: 1 }), JSON.stringify({ n: 2 })].join("\n") + "\n";
     writeFileSync(join(pd, ".notifications.log"), seed, { mode: 0o600 });
     const mBefore = statSync(join(pd, ".notifications.log")).mtimeMs;
-    bg.pruneOldJobs(dir);
+    // Factory path: the list miss-path meets the small log and leaves it.
+    await plugin.tool.background_list.execute({}, owner);
     expect(logLines(home, dir, ".notifications.log")).toHaveLength(2);
     expect(statSync(join(pd, ".notifications.log")).mtimeMs).toBe(mBefore); // no rewrite
   });

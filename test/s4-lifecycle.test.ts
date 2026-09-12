@@ -1,7 +1,10 @@
 // S4 lifecycle — real-timer behavioral burn-down of S4-COV tickets.
-// Through the public tool surface + exported hooks (runBoundedPool,
-// pruneOldJobs) only. No fake timers here (see s4-reaper.test.ts).
-// Covers: pool misuse (S4-COV-03), prune matrix (S4-COV-05), heartbeat
+// r8 strip: helpers are module-private — everything here drives the PUBLIC
+// tool surface only (pool/prune behavior via sweep + background_list; the
+// retired S4-COV-03 misuse units tested private-helper garbage inputs that no
+// factory path can pass, so they were deleted — the guards stay in src).
+// No fake timers here (see s4-reaper.test.ts).
+// Covers: prune matrix (S4-COV-05), heartbeat
 // malformed/format (S4-COV-01), deadline/timeout matrix (S4-COV-02),
 // tool-surface fallbacks (S4-COV-14), event/compact hooks (S4-COV-15),
 // notify guards (S4-COV-09), dispatch combos (S4-COV-07), poll/bashes
@@ -29,11 +32,6 @@ import {
 saveEnv();
 
 const OWNER = "owner-A";
-const BG_SPEC = "../src/plugin/background.ts";
-
-async function bgMod(): Promise<any> {
-  return (await import(/* @vite-ignore */ BG_SPEC)) as any;
-}
 
 function pd(home: string, dir: string): string {
   return projectDir(home, dir);
@@ -97,70 +95,6 @@ function tripleExists(home: string, dir: string, id: string): boolean {
   );
 }
 
-describe("S4 pool misuse (S4-COV-03)", () => {
-  let home: string;
-  beforeEach(() => {
-    home = makeHome();
-    void home;
-  });
-  afterEach(() => {
-    restoreEnv();
-  });
-
-  it("non-array items resolve to a no-op zero result", async () => {
-    const dir = makeWorkdir();
-    await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
-    expect(await bg.runBoundedPool({ client: 1 } as any, 3, 1000, async () => {})).toEqual({
-      completed: 0,
-      skipped: 0,
-    });
-  });
-
-  it("non-function fn is a safe no-op that still drains", async () => {
-    const dir = makeWorkdir();
-    await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
-    expect(await bg.runBoundedPool([1, 2, 3], 3, 5000, "nope" as any)).toEqual({
-      completed: 3,
-      skipped: 0,
-    });
-  });
-
-  it("garbage limit still drains via a single worker", async () => {
-    const dir = makeWorkdir();
-    await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
-    const seen: number[] = [];
-    const res = await bg.runBoundedPool([1, 2], 0, 5000, async (n: number) => {
-      seen.push(n);
-    });
-    expect(res).toEqual({ completed: 2, skipped: 0 });
-    expect(seen.sort()).toEqual([1, 2]);
-  });
-
-  it("zero budget defers everything to the next tick (never a reap)", async () => {
-    const dir = makeWorkdir();
-    await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
-    const res = await bg.runBoundedPool([1, 2, 3], 3, 0, async () => {});
-    expect(res).toEqual({ completed: 0, skipped: 3 });
-  });
-
-  it("one throwing item never stops the pool", async () => {
-    const dir = makeWorkdir();
-    await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
-    const done: number[] = [];
-    const res = await bg.runBoundedPool([1, 2, 3], 2, 5000, async (n: number) => {
-      if (n === 2) throw new Error("bad item");
-      done.push(n);
-    });
-    expect(res).toEqual({ completed: 3, skipped: 0 });
-    expect(done.sort()).toEqual([1, 3]);
-  });
-});
-
 describe("S4 prune matrix (S4-COV-05)", () => {
   let home: string;
   beforeEach(() => {
@@ -170,18 +104,10 @@ describe("S4 prune matrix (S4-COV-05)", () => {
     restoreEnv();
   });
 
-  it("non-string cwd is a safe no-op", async () => {
-    const dir = makeWorkdir();
-    await boot({ dir, client: makeClient() });
-    const bg = await bgMod();
-    expect(bg.pruneOldJobs(undefined as any)).toEqual([]);
-    expect(bg.pruneOldJobs({} as any)).toEqual([]);
-  });
-
   it("evil inner id refuses the triple delete (path stays inside the project dir)", async () => {
     const dir = makeWorkdir();
-    await boot({ dir, client: makeClient(), env: { BG_RETENTION_DAYS: "1" } });
-    const bg = await bgMod();
+    const plugin = await boot({ dir, client: makeClient(), env: { BG_RETENTION_DAYS: "1" } });
+    const owner = makeCtx(OWNER, dir);
     const base = pd(home, dir);
     // File name is benign; the crafted inner id carries separators.
     const evil = {
@@ -204,15 +130,18 @@ describe("S4 prune matrix (S4-COV-05)", () => {
     writeFileSync(join(base, "evil.json"), JSON.stringify(evil), { mode: 0o600 });
     writeFileSync(join(base, "evil.json.heartbeat"), `${new Date().toISOString()} | evil\n`);
     writeFileSync(join(base, "evil.json.md"), "evil\n");
-    bg.pruneOldJobs(dir);
-    // Refused: nothing outside the dir was touched and the files remain.
+    // Factory path: the list miss-path inline prune meets the same crafted
+    // record (isPrunable → deleteJobTriple → safeJobId refuses).
+    const list = String(await plugin.tool.background_list.execute({}, owner));
+    // Refused: nothing outside the dir was touched and the files remain…
     expect(existsSync(join(base, "evil.json"))).toBe(true);
+    // …and the un-deletable record is skipped from the render.
+    expect(list).not.toContain("evil-escape");
   });
 
   it("live running memory entry is never evicted even when its disk record looks prunable", async () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient(), env: { BG_RETENTION_DAYS: "1" } });
-    const bg = await bgMod();
     const owner = makeCtx(OWNER, dir);
     const id = runId(
       await plugin.tool.background_run.execute({ kind: "bash", prompt: "sleep 60" }, owner),
@@ -222,7 +151,9 @@ describe("S4 prune matrix (S4-COV-05)", () => {
     st.state = "completed";
     st.endedAt = Date.now() - 5 * 86_400_000;
     writeFileSync(join(pd(home, dir), `${id}.json`), JSON.stringify(st));
-    bg.pruneOldJobs(dir);
+    // Factory path: the list miss-path inline prune meets the prunable disk
+    // record (deleteJobTriple reaps the triple but keeps live running memory).
+    await plugin.tool.background_list.execute({}, owner);
     // Disk triple reaped (prunable on disk)…
     expect(existsSync(join(pd(home, dir), `${id}.json`))).toBe(false);
     // …but the live running entry survives in memory and still renders.
@@ -312,19 +243,30 @@ describe("S4 heartbeat malformed/format (S4-COV-01)", () => {
   });
 
   it("prune evicts a terminal memory entry when its disk record ages out", async () => {
-    const dir = makeWorkdir();
-    const plugin = await boot({ dir, client: makeClient(), env: { BG_RETENTION_DAYS: "1" } });
-    const bg = await bgMod();
-    const owner = makeCtx(OWNER, dir);
-    const id = runId(await plugin.tool.background_run.execute({ kind: "bash", prompt: "echo age" }, owner));
-    await waitTerminal(plugin, owner, id);
-    // Age the disk record past retention; memory still holds the terminal entry.
-    const st = readState(home, dir, id);
-    st.endedAt = Date.now() - 5 * 86_400_000;
-    writeFileSync(join(pd(home, dir), `${id}.json`), JSON.stringify(st));
-    expect(bg.pruneOldJobs(dir)).toEqual([id]);
-    expect(tripleExists(home, dir, id)).toBe(false);
-    expect(String(await plugin.tool.background_list.execute({}, owner))).not.toContain(id);
+    // Factory path: retention rides the 60s sweep cadence, so this is the
+    // one test that runs under fake timers (tightly scoped): boot arms the
+    // sweep on the fake clock, a planted terminal job is loaded into memory
+    // via list, its disk record is aged past retention, and one tick runs
+    // the real pruneOldJobs — reaping the triple AND evicting memory. (The
+    // list miss-path inline prune skips in-memory ids by design, so only the
+    // sweep proves the eviction.)
+    vi.useFakeTimers();
+    try {
+      const dir = makeWorkdir();
+      const plugin = await boot({ dir, client: makeClient(), env: { BG_RETENTION_DAYS: "1" } });
+      const owner = makeCtx(OWNER, dir);
+      plant(home, dir, "mem-age", { state: "completed", endedAt: Date.now() });
+      await plugin.tool.background_list.execute({}, owner); // miss: fresh, loads into memory
+      // Age the disk record past retention; memory still holds the entry.
+      const raw = JSON.parse(readFileSync(join(pd(home, dir), "mem-age.json"), "utf8"));
+      raw.endedAt = Date.now() - 5 * 86_400_000;
+      writeFileSync(join(pd(home, dir), "mem-age.json"), JSON.stringify(raw));
+      await vi.advanceTimersByTimeAsync(70_000); // one sweep tick
+      expect(tripleExists(home, dir, "mem-age")).toBe(false);
+      expect(String(await plugin.tool.background_list.execute({}, owner))).not.toContain("mem-age");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("minute-old heartbeat renders the minute arm on a queued job", async () => {

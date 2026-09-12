@@ -38,7 +38,7 @@ describe("surface", () => {
     const dir = makeWorkdir();
     const plugin = await boot({ dir, client: makeClient() });
     const out = String(await plugin.tool.background_config.execute({}, makeCtx(OWNER, dir)));
-    expect(out).toContain("background-ops v2.2.0-r7-turn-firing");
+    expect(out).toContain("OCBG v2.3.0-coven-operations");
     for (const key of [
       "maxTimeoutMinutes",
       "maxConcurrentJobs",
@@ -239,7 +239,7 @@ describe("surface", () => {
     expect(output.context.join("")).toContain(id);
     const sys: any = { system: [] };
     await (plugin as any)["experimental.chat.system.transform"]({}, sys);
-    expect(sys.system.join("")).toContain("BACKGROUND OPS");
+    expect(sys.system.join("")).toContain("OCBG");
     await plugin.tool.background_stop.execute({ id }, owner);
   });
 });

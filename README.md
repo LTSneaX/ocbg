@@ -1,6 +1,6 @@
 # ocbg — background jobs for opencode
 
-![version](https://img.shields.io/badge/version-2.2.0--r7--turn--firing-blue)
+![version](https://img.shields.io/badge/version-2.3.0--coven--operations-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 > Long jobs block the conversation. ocbg fixes that: launch a task or shell command in the background, keep talking, and get a clear signal the moment it lands.
@@ -41,7 +41,7 @@ cp src/plugin/background.ts ~/.config/opencode/plugins/background.ts
 
 ```sh
 # 4. Verify — call the background_config tool. It must print:
-# background-ops v2.2.0-r7-turn-firing
+# background-ops v2.3.0-coven-operations
 ```
 
 If the banner shows anything older, the server has not rebooted onto this build yet — restart before trusting anything.
@@ -63,7 +63,7 @@ If the banner shows anything older, the server has not rebooted onto this build 
 | Clone | `git clone https://github.com/LTSneaX/ocbg && cd ocbg` | First time — get the repo |
 | Copy to plugins (recommended) | `cp src/plugin/background.ts ~/.config/opencode/plugins/background.ts` + restart | Normal install and every update |
 | From repo (development) | Work in this repo, then copy the single file live as above | Changing the plugin itself |
-| Verify | Call `background_config` — banner must read `background-ops v2.2.0-r7-turn-firing` | After every install, update, or restart |
+| Verify | Call `background_config` — banner must read `background-ops v2.3.0-coven-operations` | After every install, update, or restart |
 
 Two rules: plugins load at server boot only (a new file on disk means nothing until restart), and the plugins directory holds only files that must run at boot — keep backups in `backups/` or git history, never beside the live file.
 

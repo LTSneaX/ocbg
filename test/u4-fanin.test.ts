@@ -65,7 +65,7 @@ describe("U4 all-complete debounced fan-in", () => {
     const wakes = wakeCalls(client, OWNER);
     expect(wakes).toHaveLength(1); // N-turn spam killed: one turn, not three
     const text = wakeText(client, OWNER);
-    expect(text.startsWith("[background-ops]")).toBe(true);
+    expect(text.startsWith("OCBG |")).toBe(true);
     for (const id of ids) expect(text).toContain(id);
     expect(text).toContain("3 jobs finished");
     expect(text).toContain("0 remaining");

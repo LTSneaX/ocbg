@@ -2,7 +2,7 @@
 //
 // Closes uncovered lines via the PUBLIC tool surface only (no src changes):
 // human-id exhaustion (96), BG_PROJECT_ID pin (126), throwing factory input
-// (162), marker-as-dir harden (195), pool garbage budget (453), reaper
+// (162), marker-as-dir harden (195), reaper
 // stat-unresolvable skip (465), evil lookup payload skip (492), queued TASK
 // drain (743), DONE-marker read fallback (908), no-summary finalize error
 // (912 + refreshBashJob funnel 993-1000), null-messages poll (958),
@@ -103,7 +103,7 @@ describe("S3b backfill surface paths", () => {
     });
     const plugin: any = await mod.default(evilInput);
     const out = String(await plugin.tool.background_config.execute({}, makeCtx(OWNER, evilInput.directory)));
-    expect(out).toContain("background-ops v");
+    expect(out).toContain("OCBG v");
     // Clientless boot still runs bash jobs end to end.
     const owner = makeCtx(OWNER, evilInput.directory);
     const id = runId(
@@ -125,15 +125,6 @@ describe("S3b backfill surface paths", () => {
     );
     const body = await waitTerminal(plugin, owner, id);
     expect(body).toContain("harden-ok");
-  });
-
-  it("runBoundedPool throwing budget resolves the safe no-op (outer guard)", async () => {
-    vi.resetModules();
-    const mod = (await import(/* @vite-ignore */ BG_SPEC)) as any;
-    const evilBudget = { valueOf() { throw new Error("evil budget"); } };
-    await expect(
-      mod.runBoundedPool([], 1, evilBudget as any, async () => {}),
-    ).resolves.toEqual({ completed: 0, skipped: 0 });
   });
 
   it("reaper skips bash with unresolvable output stat (missing .md)", async () => {

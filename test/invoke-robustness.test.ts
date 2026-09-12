@@ -63,42 +63,6 @@ describe("invoke-robustness: every export unthrowable on {} / undefined", () => 
     }
   });
 
-  it("runBoundedPool garbage resolves to the safe no-op; well-formed unchanged", async () => {
-    const mod = await freshModule();
-    await expect(mod.runBoundedPool({} as any)).resolves.toEqual({
-      completed: 0,
-      skipped: 0,
-    });
-    await expect(mod.runBoundedPool(undefined as any)).resolves.toEqual({
-      completed: 0,
-      skipped: 0,
-    });
-    const res = await mod.runBoundedPool(["a", "b"], 3, 60_000, async () => {});
-    expect(res).toEqual({ completed: 2, skipped: 0 });
-  });
-
-  it("debouncer garbage never throws: schedule/cancel/flush + armed timer fires clean", async () => {
-    const mod = await freshModule();
-    for (const shape of [{}, undefined]) {
-      const d = mod.createTrailingDebouncer(shape as any, undefined as any);
-      expect(typeof d.schedule).toBe("function");
-      expect(typeof d.cancel).toBe("function");
-      expect(typeof d.flush).toBe("function");
-      d.schedule();
-      await new Promise((r) => setTimeout(r, 50));
-      d.flush();
-      d.schedule();
-      d.cancel();
-      await new Promise((r) => setTimeout(r, 50));
-    }
-  });
-
-  it("pruneOldJobs garbage returns [] without touching disk", async () => {
-    const mod = await freshModule();
-    expect(mod.pruneOldJobs({} as any)).toEqual([]);
-    expect(mod.pruneOldJobs(undefined as any)).toEqual([]);
-  });
-
   it("BackgroundOps + default resolve on undefined/{} with 7 tools present", async () => {
     const mod = await freshModule();
     for (const factory of [mod.BackgroundOps, mod.default]) {
@@ -141,7 +105,7 @@ describe("BG_DEBUG env-gated boot diagnostics", () => {
     const blob = errSpy.mock.calls
       .map((c: unknown[]) => c.join(" "))
       .join("\n");
-    expect(blob).toContain("[background-ops:debug]");
+    expect(blob).toContain("OCBG | debug");
     for (const needle of [
       "factory entry",
       "guard decision",

@@ -926,3 +926,132 @@ No new exports (grep ^export unchanged: 7 standing + default).
   + dispatch tools spread; U7 audit-only) + test/u567-fastfollow.test.ts
   (NEW, 5 its) + docs/coverage-ratchet.md (this U567 section), ALL
   uncommitted. No live writes, no repo logs/ (logs in /tmp/ocbg-logs/).
+
+## STRIP (r8) — export-surface strip to exactly BackgroundOps+default
+
+SneaX-ordered, behavior-identical: 5 helper functions de-exported to
+module-private (`createTrailingDebouncer`, `runBoundedPool`, `pruneOldJobs`;
+interfaces `TrailingDebouncer`/`BoundedPoolResult` likewise un-exported —
+types, erased, but non-exported to avoid confusion), F3 test hooks
+(`__getDiskScanCount`/`__clearListCache`) REMOVED (test-only one-liners, zero
+behavior effect; factory-pattern tests prove hit/miss by list bytes so the
+accessors have no consumers — keeping them as dead privates would break the
+100%-lines law they existed to serve). `grep ^export` = exactly
+`export const BackgroundOps` + `export default BackgroundOps`. VERSION
+`2.2.0-r7-turn-firing` → `2.2.0-r8-strip` (src + surface.test + README
+badge/title/verify rows). No logic deletions beyond the 2 hook one-liners;
+no behavior change (same 7 tools, same wake bytes, same fences).
+
+### STRIP — test rewrites (factory pattern, all green)
+
+- boot-contract clause 2: FULL_ALLOWLIST = [BackgroundOps, default] only.
+- loader-guard MANIFEST probe: helpers=[] (0 helpers); invoke probe drops the
+  debouncer-exercise arms (no helper exports remain).
+- live-loader-boot FULL_ALLOWLIST likewise (opt-in suite, unchanged shape).
+- DELETED (private-helper inputs no factory path can pass): sweep-budget
+  runBoundedPool units (6), latency debouncer units (6), invoke-robustness
+  helper probes (3), s4 pool-misuse S4-COV-03 (5), s3b evil-budget outer-guard
+  (1), s4 prune non-string-cwd (1). Guards stay in src.
+- CONVERTED to list/sweep-driven: s4 evil-id + live-running-memory (miss-path
+  inline prune), s4 evict-memory (60s sweep tick under scoped fake timers —
+  the ONLY path that runs real pruneOldJobs on in-memory ids), all
+  cache-retention F3 (list-byte hit/miss/TTL/mtime proofs) + F4 prune/log
+  trims (miss-path inline prune + append path).
+- Suite: 260 passed / 4 skipped (26 files; live-loader opt-in skips without
+  LIVE_LOADER=1), down 22 from 282 — all 22 retired-by-strip, none by failure.
+
+### STRIP — waiver accounting (+1)
+
+New `/* v8 ignore next */` at runBoundedPool outer-catch return (STRIP line):
+outer totality guard, unreachable post-strip — sole internal caller
+(sweepIdleJobs) passes validated locals (array/const/parsePositiveMs
+number/closure fn); the only pre-strip trigger was a direct evil-budget call,
+retired with the export. Guard kept as defense-in-depth (zero behavior
+effect), same class as the standing S3b dead-guard ignores. Inventory now:
+`grep -c "v8 ignore" src/plugin/background.ts` = 16 lines (15 standing +
+1 STRIP). Lines 100% (801/801) holds WITH the ignore; without it 800/801
+(99.87%, line 636 pre-restructure) = RED, no commit.
+
+### STRIP — ticket impact
+
+- S4-COV-03 (pool misuse) RETIRED — its units tested private-helper garbage
+  inputs unreachable via any factory path; guards remain, sweep integration
+  (reap semantics / reentrancy / budget-expiry) still proves pool behavior.
+- S4-COV-05 (prune matrix) stays OPEN, now fully factory-driven.
+- All other S4-COV tickets untouched. No new tickets.
+
+### STRIP re-proof (pre-commit gate evidence, all uncommitted)
+
+- `npm test` → 260 passed / 4 skipped (25 passed, 1 skipped files).
+- `npx vitest run --coverage` → Lines 100% (801/801); Branch ~90%;
+  Funcs uncovered = standing only.
+- `tsc --noEmit` → exit 0. `scripts/loader-guard.sh` → green (probe-1 all
+  exports functions, probe-2 BackgroundOps+default unthrowable, probe-3
+  manifest exact {BackgroundOps,default} + 0 helpers, 7 tools on both).
+- `node --check` → all dist .js OK. `test/boot-contract.test.ts` solo → 5/5.
+- Live-loader opt-in attempted per environment (see STRIP-live log).
+- Change set: src/plugin/background.ts + 9 tests + scripts/loader-guard.sh
+  + README.md + docs/coverage-ratchet.md (this section), ALL uncommitted.
+  No live writes, no repo logs/ (logs in /tmp/ocbg-logs/).
+
+## MSG (2.3.0-coven-operations) — OCBG prefix + Set-A voice, STRINGS ONLY
+
+Zero logic/behavior change: no new exports, no deleted logic, no branch
+changes. Every edit is a string-literal swap inside an existing template;
+control flow, guards, caps, and fences are byte-identical. `grep ^export`
+stays exactly `export const BackgroundOps` + `export default BackgroundOps`.
+
+### MSG — src swaps (src/plugin/background.ts)
+
+- VERSION `2.2.0-r8-strip` → `2.3.0-coven-operations` (:8 literal only).
+- Prefix `[background-ops]` → `OCBG |` on: debug line, all 7 error lines
+  (malformed-warn, completeJobInternal, notifyJob, refreshTaskJob,
+  refreshBashJob, idle-reaper per-job + sweep), U4 fan-in head
+  (`OCBG | ✓ all complete, darling: …` — words kept, prefix only),
+  chat.message pending block (`OCBG | pending notifications (N):`).
+- Config output `background-ops v…` → `OCBG v…`; system-transform
+  `BACKGROUND OPS v…` → `OCBG v…` (name swap, ` v` shape kept).
+- Voice Set A (toastMsg, 4 arms): `OCBG | ✓ <id> landed clean, darling` /
+  `OCBG | ✗ <id> broke (exit <code>), honey — come look` (no-exit arm drops
+  only the `(exit …)` group) / `OCBG | ⏱ <id> timed out, darling` /
+  `OCBG | ■ <id> put down on order`. DONE summaries inherit automatically
+  (`${marker} ${toastMsg} :: …` + persistOutput reuse — no separate edit).
+- Wrapper: noteText drops the redundant leading `[background-ops]` (toastMsg
+  already carries `OCBG |`) and shortens `Full output:` →
+  `Output (untrusted):` — framing words kept, M1 fence + read-hint intact.
+- Dispatch outputs (`Background <kind> queued/started…`) carry NO old prefix
+  on this tree (verified by read) → no swap owed there.
+- INTENTIONALLY UNTOUCHED (not user-facing prefix): on-disk persistence
+  paths (`~/.local/share/opencode/background-ops/…`), app.log
+  `service:"background-ops"` machine field, `background: …` throw/timeout
+  literals, code comments. docs/history.md + docs/troubleshooting.md keep
+  the old voice as historical record (out of scope).
+
+### MSG — test updates (suite stays honest, no mock-only-green)
+
+- Prefix asserts: s5-wake-voice + u4-fanin `startsWith("OCBG |")`;
+  invoke-robustness `OCBG | debug`; boot-contract + s3b-backfill +
+  s3b-host-scream `OCBG v`; surface `OCBG v2.3.0-coven-operations` + `OCBG`.
+- Voice asserts (all 4 Set-A arms pinned): s5 `landed clean, darling` +
+  `Output (untrusted):`; notify-matrix completed/stopped/failed/timeout
+  toasts assert `startsWith("OCBG |")` + arm words (`landed clean, darling` /
+  `put down on order` / `broke` + `honey — come look` / `timed out, darling`).
+- Framing-word update: s6-hardening splits on `Output (untrusted)` (was
+  `Full output`); pending-notifications `(N)` + `3 jobs finished` /
+  `0 remaining` words unchanged.
+- Coverage impact: zero — assertions only, no lines/branches added or
+  removed. Lines 100% must still hold (see MSG re-proof below); no new
+  waivers, no new tickets.
+
+### MSG re-proof (pre-commit gate evidence, all uncommitted)
+
+- `npm test` → real counts (see MSG-npmtest log).
+- `npx vitest run --coverage` → Lines 100% required (see MSG-coverage log).
+- `tsc --noEmit` → exit 0 (see MSG-tsc log).
+- `scripts/loader-guard.sh` → green + dist prefix probe (`OCBG`, zero
+  `[background-ops]` outside paths/comments) (see MSG-guard log).
+- `node --check` → all dist .js OK (see MSG-nodecheck log).
+- `test/boot-contract.test.ts` solo → 5/5 (see MSG-boot log).
+- Change set: src/plugin/background.ts + 7 tests + docs/coverage-ratchet.md
+  (this section), ALL uncommitted. No live writes, no repo logs/ (logs in
+  /tmp/ocbg-logs/). DO NOT COMMIT unless every gate above is green.

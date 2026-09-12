@@ -94,6 +94,9 @@ describe("G1 notify matrix", () => {
     await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(t.client, OWNER)).toHaveLength(1);
     expect(t.client.tui.showToast).toHaveBeenCalledTimes(1);
+    const doneToast: string = t.client.tui.showToast.mock.calls[0][0]?.body?.message ?? "";
+    expect(doneToast.startsWith("OCBG |")).toBe(true); // MSG refresh: OCBG prefix
+    expect(doneToast).toContain("landed clean, darling"); // Set-A voice (completed)
     expect(t.client.app.log).toHaveBeenCalledTimes(1);
     const notes = readNotifications(home, t.dir);
     expect(notes.find((n: any) => n.id === t.id)?.event).toBe("done");
@@ -152,6 +155,9 @@ describe("G1 notify matrix", () => {
     expect(t.client.tui.showToast).toHaveBeenCalledTimes(1);
     const toastArg = t.client.tui.showToast.mock.calls[0][0];
     expect(toastArg?.body?.variant).toBe("error");
+    expect(String(toastArg?.body?.message ?? "").startsWith("OCBG |")).toBe(true); // MSG refresh
+    expect(String(toastArg?.body?.message ?? "")).toContain("broke"); // Set-A voice (failed)
+    expect(String(toastArg?.body?.message ?? "")).toContain("honey — come look");
     const logArg = t.client.app.log.mock.calls[0][0];
     expect(logArg?.body?.level).toBe("error");
     expect(readNotifications(home, t.dir).find((n: any) => n.id === t.id)?.event).toBe("failed");
@@ -206,6 +212,9 @@ describe("G1 notify matrix", () => {
     await waitFanin(); // U4: parent wake is debounced (≤200ms), not instant
     expect(wakeCalls(t.client, OWNER)).toHaveLength(1);
     expect(t.client.tui.showToast).toHaveBeenCalledTimes(1);
+    const stoppedToast: string = t.client.tui.showToast.mock.calls[0][0]?.body?.message ?? "";
+    expect(stoppedToast.startsWith("OCBG |")).toBe(true); // MSG refresh: OCBG prefix
+    expect(stoppedToast).toContain("put down on order"); // Set-A voice (stopped)
     expect(readNotifications(home, t.dir).find((n: any) => n.id === t.id)?.event).toBe("stopped");
     expect(st.summary).toContain("[DONE STOPPED]");
   });
@@ -260,7 +269,8 @@ describe("G1 notify matrix", () => {
     expect(wakeCalls(t.client, OWNER)).toHaveLength(1);
     expect(readNotifications(home, t.dir).find((n: any) => n.id === t.id)?.event).toBe("timeout");
     const toastMsg: string = t.client.tui.showToast.mock.calls[0][0]?.body?.message ?? "";
-    expect(toastMsg).toContain("timed out");
+    expect(toastMsg.startsWith("OCBG |")).toBe(true); // MSG refresh: OCBG prefix
+    expect(toastMsg).toContain("timed out, darling"); // Set-A voice (timeout)
     expect(st.summary).toContain("[DONE STOPPED]");
   });
 

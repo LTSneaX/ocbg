@@ -68,8 +68,10 @@ describe("S5 wake-voice", () => {
     const body = calls[0]?.[0]?.body ?? {};
     expect("noReply" in body).toBe(false); // reply-mode: arrival triggers parent action
     const text = body?.parts?.[0]?.text ?? "";
-    expect(text.startsWith("[background-ops]")).toBe(true); // trusted prefix
+    expect(text.startsWith("OCBG |")).toBe(true); // trusted prefix
+    expect(text).toContain("landed clean, darling"); // Set-A voice (completed)
     expect(text).toContain("Untrusted child output"); // untrusted fence
+    expect(text).toContain("Output (untrusted):"); // shortened framing words
     expect(text).toContain(`background_read("${id}")`); // read-hint
   });
 
